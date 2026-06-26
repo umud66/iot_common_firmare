@@ -72,9 +72,19 @@ type timerAction struct {
 	Duty       int               `json:"duty,omitempty"`
 	From       int               `json:"from,omitempty"`
 	To         int               `json:"to,omitempty"`
+	MinDuty    int               `json:"minDuty,omitempty"`
+	MaxDuty    int               `json:"maxDuty,omitempty"`
+	LowDuty    int               `json:"lowDuty,omitempty"`
+	HighDuty   int               `json:"highDuty,omitempty"`
+	Control1   int               `json:"control1,omitempty"`
+	Control2   int               `json:"control2,omitempty"`
 	DurationMs int               `json:"durationMs,omitempty"`
 	IntervalMs int               `json:"intervalMs,omitempty"`
+	PeriodMs   int               `json:"periodMs,omitempty"`
+	OnDurationMs int             `json:"onDurationMs,omitempty"`
+	OffDurationMs int            `json:"offDurationMs,omitempty"`
 	Repeat     int               `json:"repeat,omitempty"`
+	Smoothing  int               `json:"smoothing,omitempty"`
 	Curve      string            `json:"curve,omitempty"`
 	Loop       bool              `json:"loop,omitempty"`
 	Steps      []sequenceStep    `json:"steps,omitempty"`
@@ -425,20 +435,29 @@ func (s *simulator) commandFromTimer(targetID string, action timerAction) driver
 		params["to"] = action.To
 		params["durationMs"] = action.DurationMs
 		params["curve"] = action.Curve
-	case "sequence":
-		params["steps"] = action.Steps
+	case "sineWave":
+		params["minDuty"] = action.MinDuty
+		params["maxDuty"] = action.MaxDuty
+		params["periodMs"] = action.PeriodMs
 		params["loop"] = action.Loop
-	case "softStart":
-		params["to"] = action.To
-		params["durationMs"] = action.DurationMs
-	case "softStop":
+	case "bezierWave":
 		params["from"] = action.From
+		params["to"] = action.To
+		params["control1"] = action.Control1
+		params["control2"] = action.Control2
 		params["durationMs"] = action.DurationMs
-	case "pulse":
-		params["duty"] = action.Duty
-		params["durationMs"] = action.DurationMs
+		params["loop"] = action.Loop
+	case "randomWave":
+		params["minDuty"] = action.MinDuty
+		params["maxDuty"] = action.MaxDuty
 		params["intervalMs"] = action.IntervalMs
-		params["repeat"] = action.Repeat
+		params["smoothing"] = action.Smoothing
+		params["loop"] = action.Loop
+	case "pulseWave":
+		params["lowDuty"] = action.LowDuty
+		params["highDuty"] = action.HighDuty
+		params["onDurationMs"] = action.OnDurationMs
+		params["offDurationMs"] = action.OffDurationMs
 		params["loop"] = action.Loop
 	case "maxPower":
 		mode = "direct"
@@ -469,14 +488,12 @@ func functionToMode(function string) string {
 	switch function {
 	case "stop":
 		return "stop"
-	case "softStart":
-		return "softStart"
-	case "softStop":
-		return "softStop"
-	case "pulse":
-		return "pulse"
 	case "maxPower":
 		return "maxPower"
+	case "gentleWave":
+		return "sineWave"
+	case "randomWave":
+		return "randomWave"
 	case "toggle":
 		return "toggle"
 	default:
@@ -636,46 +653,64 @@ func (s *simulator) applyPWMCommand(command driverCommand) error {
 	case "direct":
 		channel.Duty = intValue(command.Params, "duty", 0)
 		channel.Mode = "direct"
-		log.Printf("[PWM] %s 直接设置 duty=%d", command.TargetID, channel.Duty)
+		log.Printf("[造浪] %s 定速 duty=%d", command.TargetID, channel.Duty)
 	case "linearRamp":
 		fromDuty := intValue(command.Params, "from", channel.Duty)
 		toDuty := intValue(command.Params, "to", channel.Duty)
 		durationMs := intValue(command.Params, "durationMs", 1000)
 		channel.Duty = toDuty
 		channel.Mode = "linearRamp"
-		log.Printf("[PWM] %s 线性变速 %d -> %d duration=%dms", command.TargetID, fromDuty, toDuty, durationMs)
-	case "sequence":
-		steps := stepList(command.Params["steps"])
-		channel.Duty = finalDutyFromSteps(steps, channel.Duty)
-		channel.Mode = "sequence"
-		log.Printf("[PWM] %s 序列控制 steps=%d finalDuty=%d loop=%v", command.TargetID, len(steps), channel.Duty, boolValue(command.Params, "loop", false))
+		log.Printf("[造浪] %s 线性变速 %d -> %d duration=%dms", command.TargetID, fromDuty, toDuty, durationMs)
+	case "sineWave":
+		channel.Duty = intValue(command.Params, "maxDuty", channel.Duty)
+		channel.Mode = "sineWave"
+		log.Printf("[造浪] %s 正弦波 min=%d max=%d period=%dms loop=%v",
+			command.TargetID,
+			intValue(command.Params, "minDuty", 0),
+			intValue(command.Params, "maxDuty", channel.Duty),
+			intValue(command.Params, "periodMs", 2500),
+			boolValue(command.Params, "loop", false),
+		)
+	case "bezierWave":
+		channel.Duty = intValue(command.Params, "to", channel.Duty)
+		channel.Mode = "bezierWave"
+		log.Printf("[造浪] %s 贝塞尔波 from=%d c1=%d c2=%d to=%d duration=%dms loop=%v",
+			command.TargetID,
+			intValue(command.Params, "from", 0),
+			intValue(command.Params, "control1", 0),
+			intValue(command.Params, "control2", 0),
+			intValue(command.Params, "to", channel.Duty),
+			intValue(command.Params, "durationMs", 3000),
+			boolValue(command.Params, "loop", false),
+		)
+	case "randomWave":
+		channel.Duty = intValue(command.Params, "maxDuty", channel.Duty)
+		channel.Mode = "randomWave"
+		log.Printf("[造浪] %s 随机波 min=%d max=%d interval=%dms smoothing=%d loop=%v",
+			command.TargetID,
+			intValue(command.Params, "minDuty", 0),
+			intValue(command.Params, "maxDuty", channel.Duty),
+			intValue(command.Params, "intervalMs", 1200),
+			intValue(command.Params, "smoothing", 0),
+			boolValue(command.Params, "loop", false),
+		)
+	case "pulseWave":
+		channel.Duty = intValue(command.Params, "highDuty", channel.Duty)
+		channel.Mode = "pulseWave"
+		log.Printf("[造浪] %s 脉冲波 low=%d high=%d on=%dms off=%dms loop=%v",
+			command.TargetID,
+			intValue(command.Params, "lowDuty", 0),
+			intValue(command.Params, "highDuty", channel.Duty),
+			intValue(command.Params, "onDurationMs", 800),
+			intValue(command.Params, "offDurationMs", 1200),
+			boolValue(command.Params, "loop", false),
+		)
 	case "stop":
 		channel.Duty = 0
 		channel.Mode = "stop"
-		log.Printf("[PWM] %s 停止输出", command.TargetID)
-	case "softStart":
-		channel.Duty = intValue(command.Params, "to", channel.Duty)
-		channel.Mode = "softStart"
-		log.Printf("[PWM] %s 软启动 to=%d duration=%dms", command.TargetID, channel.Duty, intValue(command.Params, "durationMs", 1000))
-	case "softStop":
-		fromDuty := intValue(command.Params, "from", channel.Duty)
-		channel.Duty = 0
-		channel.Mode = "softStop"
-		log.Printf("[PWM] %s 软停止 from=%d duration=%dms", command.TargetID, fromDuty, intValue(command.Params, "durationMs", 1000))
-	case "pulse":
-		pulseDuty := intValue(command.Params, "duty", channel.Duty)
-		channel.Duty = 0
-		channel.Mode = "pulse"
-		log.Printf("[PWM] %s 脉冲 duty=%d hold=%dms interval=%dms repeat=%d loop=%v",
-			command.TargetID,
-			pulseDuty,
-			intValue(command.Params, "durationMs", 1000),
-			intValue(command.Params, "intervalMs", 1000),
-			intValue(command.Params, "repeat", 1),
-			boolValue(command.Params, "loop", false),
-		)
+		log.Printf("[造浪] %s 停止输出", command.TargetID)
 	default:
-		log.Printf("[PWM] 未支持操作 %s", command.Operation)
+		log.Printf("[造浪] 未支持操作 %s", command.Operation)
 	}
 	return nil
 }
@@ -935,6 +970,18 @@ func (s *simulator) executeConsoleCommand(line string) error {
 			return err
 		}
 		return s.publishStateReport("console-pwm")
+	case "wave":
+		if len(parts) < 3 {
+			return fmt.Errorf("用法: wave <targetId> <direct|linearRamp|sineWave|bezierWave|randomWave|pulseWave|stop>")
+		}
+		command, err := buildWaveConsoleCommand(parts)
+		if err != nil {
+			return err
+		}
+		if err := s.applyCommand(command); err != nil {
+			return err
+		}
+		return s.publishStateReport("console-wave")
 	case "temp":
 		if len(parts) < 3 {
 			return fmt.Errorf("用法: temp <targetId> <value>")
@@ -958,6 +1005,57 @@ func (s *simulator) executeConsoleCommand(line string) error {
 		return fmt.Errorf("未知命令: %s", parts[0])
 	}
 	return nil
+}
+
+func buildWaveConsoleCommand(parts []string) (driverCommand, error) {
+	targetID := parts[1]
+	mode := parts[2]
+	command := driverCommand{
+		TargetID:  targetID,
+		Kind:      "mos_pwm",
+		Operation: mode,
+		Params:    map[string]any{},
+	}
+
+	switch mode {
+	case "direct":
+		command.Params["duty"] = 700
+		if len(parts) >= 4 {
+			command.Params["duty"] = parseInt(parts[3], 700)
+		}
+	case "linearRamp":
+		command.Params["from"] = 220
+		command.Params["to"] = 820
+		command.Params["durationMs"] = 3000
+	case "sineWave":
+		command.Params["minDuty"] = 240
+		command.Params["maxDuty"] = 820
+		command.Params["periodMs"] = 2500
+		command.Params["loop"] = true
+	case "bezierWave":
+		command.Params["from"] = 220
+		command.Params["to"] = 820
+		command.Params["control1"] = 760
+		command.Params["control2"] = 320
+		command.Params["durationMs"] = 3000
+		command.Params["loop"] = true
+	case "randomWave":
+		command.Params["minDuty"] = 260
+		command.Params["maxDuty"] = 880
+		command.Params["intervalMs"] = 1200
+		command.Params["smoothing"] = 35
+		command.Params["loop"] = true
+	case "pulseWave":
+		command.Params["lowDuty"] = 260
+		command.Params["highDuty"] = 860
+		command.Params["onDurationMs"] = 800
+		command.Params["offDurationMs"] = 1200
+		command.Params["loop"] = true
+	case "stop":
+	default:
+		return driverCommand{}, fmt.Errorf("不支持的造浪模式: %s", mode)
+	}
+	return command, nil
 }
 
 func (s *simulator) setTemperature(targetID string, value float64) error {
@@ -990,7 +1088,7 @@ func (s *simulator) printChannelStatus() {
 		case "relay":
 			log.Printf("[状态] relay target=%s state=%s mode=%s", channel.TargetID, channel.State, channel.Mode)
 		case "mos_pwm":
-			log.Printf("[状态] pwm target=%s duty=%d mode=%s", channel.TargetID, channel.Duty, channel.Mode)
+			log.Printf("[状态] wave target=%s duty=%d mode=%s", channel.TargetID, channel.Duty, channel.Mode)
 		case "sensor_temperature":
 			log.Printf("[状态] temp target=%s value=%.2f mode=%s", channel.TargetID, channel.TemperatureC, channel.Mode)
 		default:
@@ -1009,6 +1107,7 @@ func (s *simulator) printConsoleHelp() {
 	log.Println("[控制台]   bootstrap")
 	log.Println("[控制台]   relay <targetId> <on|off|toggle>")
 	log.Println("[控制台]   pwm <targetId> <duty>")
+	log.Println("[控制台]   wave <targetId> <direct|linearRamp|sineWave|bezierWave|randomWave|pulseWave|stop>")
 	log.Println("[控制台]   temp <targetId> <value>")
 	log.Println("[控制台]   command <json>")
 	log.Println("[控制台]   quit")
