@@ -1,2 +1,4 @@
 device-sim/device-sim.json
 device-sim/device-sim
+device-sim/*_test.go
+*.json

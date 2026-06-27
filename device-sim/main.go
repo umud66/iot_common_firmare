@@ -36,11 +36,105 @@ type simulatorConfig struct {
 type runtimeChannel struct {
 	TargetID     string
 	Kind         string
+	GPIO         int
 	State        string
 	Duty         int
 	Mode         string
 	TemperatureC float64
 	Status       string
+}
+
+type pwmRuntime struct {
+	Mode        string
+	Params      map[string]any
+	StartedAt   time.Time
+	LastRunAt   time.Time
+	Completed   bool
+	RandomSeed  uint64
+	RandomDuty  int
+	CurrentDuty float64
+}
+
+func loopCountValue(params map[string]any) int {
+	value, ok := params["loop"]
+	if !ok {
+		return 0
+	}
+	switch item := value.(type) {
+	case bool:
+		if item {
+			return -1
+		}
+		return 0
+	case int:
+		return item
+	case int32:
+		return int(item)
+	case int64:
+		return int(item)
+	case float32:
+		return int(item)
+	case float64:
+		return int(item)
+	default:
+		return 0
+	}
+}
+
+func directionValue(params map[string]any, fallback string) string {
+	value, ok := params["direction"].(string)
+	if ok && value != "" {
+		return value
+	}
+	return fallback
+}
+
+func normFloat(value float64, start float64, end float64) float64 {
+	if end == start {
+		return 0
+	}
+	return clampFloat((value-start)/(end-start), 0, 1)
+}
+
+func curveProgress(progress float64, curve string, fromDuty int, control1 int, control2 int, toDuty int) float64 {
+	progress = clampFloat(progress, 0, 1)
+	switch curve {
+	case "", "linear":
+		return progress
+	case "easeIn":
+		return progress * progress * progress
+	case "easeOut":
+		inv := 1 - progress
+		return 1 - inv*inv*inv
+	case "easeInOut":
+		if progress < 0.5 {
+			return 4 * progress * progress * progress
+		}
+		inv := -2*progress + 2
+		return 1 - (inv*inv*inv)/2
+	case "smooth":
+		return progress * progress * (3 - 2*progress)
+	case "sineIn":
+		return 1 - math.Cos((progress*math.Pi)/2)
+	case "sineOut":
+		return math.Sin((progress * math.Pi) / 2)
+	case "sineInOut":
+		return -(math.Cos(math.Pi*progress) - 1) / 2
+	case "backIn":
+		const c1 = 1.70158
+		const c3 = c1 + 1
+		return c3*progress*progress*progress - c1*progress*progress
+	case "backOut":
+		const c1 = 1.70158
+		const c3 = c1 + 1
+		p := progress - 1
+		return 1 + c3*p*p*p + c1*p*p
+	case "customBezier":
+		value := cubicBezier(progress, float64(fromDuty), float64(control1), float64(control2), float64(toDuty))
+		return normFloat(value, float64(fromDuty), float64(toDuty))
+	default:
+		return progress
+	}
 }
 
 type transportConfig struct {
@@ -52,6 +146,7 @@ type transportConfig struct {
 type capability struct {
 	ID           string `json:"id"`
 	Kind         string `json:"kind"`
+	GPIO         int    `json:"gpio,omitempty"`
 	DefaultState string `json:"defaultState,omitempty"`
 }
 
@@ -66,29 +161,30 @@ type sequenceChannel struct {
 }
 
 type timerAction struct {
-	Function   string            `json:"function,omitempty"`
-	Mode       string            `json:"mode"`
-	State      string            `json:"state,omitempty"`
-	Duty       int               `json:"duty,omitempty"`
-	From       int               `json:"from,omitempty"`
-	To         int               `json:"to,omitempty"`
-	MinDuty    int               `json:"minDuty,omitempty"`
-	MaxDuty    int               `json:"maxDuty,omitempty"`
-	LowDuty    int               `json:"lowDuty,omitempty"`
-	HighDuty   int               `json:"highDuty,omitempty"`
-	Control1   int               `json:"control1,omitempty"`
-	Control2   int               `json:"control2,omitempty"`
-	DurationMs int               `json:"durationMs,omitempty"`
-	IntervalMs int               `json:"intervalMs,omitempty"`
-	PeriodMs   int               `json:"periodMs,omitempty"`
-	OnDurationMs int             `json:"onDurationMs,omitempty"`
-	OffDurationMs int            `json:"offDurationMs,omitempty"`
-	Repeat     int               `json:"repeat,omitempty"`
-	Smoothing  int               `json:"smoothing,omitempty"`
-	Curve      string            `json:"curve,omitempty"`
-	Loop       bool              `json:"loop,omitempty"`
-	Steps      []sequenceStep    `json:"steps,omitempty"`
-	Channels   []sequenceChannel `json:"channels,omitempty"`
+	Function      string            `json:"function,omitempty"`
+	Mode          string            `json:"mode"`
+	State         string            `json:"state,omitempty"`
+	Duty          int               `json:"duty,omitempty"`
+	From          int               `json:"from,omitempty"`
+	To            int               `json:"to,omitempty"`
+	MinDuty       int               `json:"minDuty,omitempty"`
+	MaxDuty       int               `json:"maxDuty,omitempty"`
+	LowDuty       int               `json:"lowDuty,omitempty"`
+	HighDuty      int               `json:"highDuty,omitempty"`
+	Control1      int               `json:"control1,omitempty"`
+	Control2      int               `json:"control2,omitempty"`
+	DurationMs    int               `json:"durationMs,omitempty"`
+	IntervalMs    int               `json:"intervalMs,omitempty"`
+	PeriodMs      int               `json:"periodMs,omitempty"`
+	OnDurationMs  int               `json:"onDurationMs,omitempty"`
+	OffDurationMs int               `json:"offDurationMs,omitempty"`
+	Repeat        int               `json:"repeat,omitempty"`
+	Smoothing     int               `json:"smoothing,omitempty"`
+	Curve         string            `json:"curve,omitempty"`
+	Direction     string            `json:"direction,omitempty"`
+	Loop          int               `json:"loop,omitempty"`
+	Steps         []sequenceStep    `json:"steps,omitempty"`
+	Channels      []sequenceChannel `json:"channels,omitempty"`
 }
 
 type weeklyTimer struct {
@@ -169,6 +265,7 @@ type deviceStateReport struct {
 	Rssi       int                           `json:"rssi,omitempty"`
 	UptimeMs   uint64                        `json:"uptimeMs,omitempty"`
 	Channels   map[string]channelStateReport `json:"channels,omitempty"`
+	Metrics    map[string]float64            `json:"metrics,omitempty"`
 	LastError  string                        `json:"lastError,omitempty"`
 	ReportedAt string                        `json:"reportedAt,omitempty"`
 }
@@ -178,9 +275,17 @@ type pairResponse struct {
 	Bootstrap   bootstrapPayload `json:"bootstrap"`
 }
 
+type simulatorState struct {
+	StateVersion int               `json:"stateVersion"`
+	Bootstrap    bootstrapPayload  `json:"bootstrap"`
+	LastReport   deviceStateReport `json:"lastReport,omitempty"`
+	SavedAt      string            `json:"savedAt"`
+}
+
 type simulator struct {
 	config     simulatorConfig
 	configPath string
+	statePath  string
 	httpClient *http.Client
 	mqttClient mqttclient.Client
 
@@ -192,6 +297,12 @@ type simulator struct {
 	reportTicker *time.Ticker
 	timerTicker  *time.Ticker
 	lastTimerRun map[string]string
+	formulas     map[string]*formulaRuntime
+	scripts      map[string]*scriptRuntime
+	pwmRuntimes  map[string]*pwmRuntime
+	metrics      map[string]float64
+	lastReport   deviceStateReport
+	gpioBackend  gpioBackend
 }
 
 func main() {
@@ -204,12 +315,18 @@ func main() {
 	deviceSimulator := &simulator{
 		config:     config,
 		configPath: configPath,
+		statePath:  strings.TrimSuffix(configPath, filepath.Ext(configPath)) + ".state.json",
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
 		channels:     map[string]*runtimeChannel{},
 		startedAt:    time.Now(),
 		lastTimerRun: map[string]string{},
+		formulas:     map[string]*formulaRuntime{},
+		scripts:      map[string]*scriptRuntime{},
+		pwmRuntimes:  map[string]*pwmRuntime{},
+		metrics:      map[string]float64{},
+		gpioBackend:  consoleGPIOBackend{},
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -220,35 +337,45 @@ func main() {
 	}
 	defer deviceSimulator.close()
 
-	go deviceSimulator.runConsole(ctx)
-
 	<-ctx.Done()
 	log.Println("收到退出信号，设备仿真端正在关闭")
 }
 
 func (s *simulator) bootstrapSession(ctx context.Context) error {
-	if err := s.ensureInteractiveConfig(); err != nil {
+	if err := s.prepareConfig(); err != nil {
 		return err
+	}
+	if err := s.loadSavedState(); err != nil {
+		log.Printf("加载本地仿真状态失败: %v", err)
 	}
 
-	var err error
 	if s.config.DeviceToken == "" {
-		err = s.pairDevice()
-	} else {
-		err = s.fetchBootstrap()
+		if err := s.pairDevice(); err != nil {
+			if s.hasSavedBootstrap() {
+				log.Printf("配对失败，回退到本地已保存配置继续启动: %v", err)
+			} else {
+				return err
+			}
+		}
+	} else if err := s.fetchBootstrap(); err != nil {
+		if s.hasSavedBootstrap() {
+			log.Printf("同步服务端功能模块失败，回退到本地已保存配置继续启动: %v", err)
+		} else {
+			return err
+		}
 	}
-	if err != nil {
-		return err
+	if !s.hasSavedBootstrap() {
+		return fmt.Errorf("当前没有可用的功能模块配置，请先完成配对并同步一次服务端配置")
 	}
 
 	s.initializeChannels()
+	s.restoreLastChannelState()
 	if err := s.connectMQTT(ctx); err != nil {
 		return err
 	}
 	s.startTimerLoop(ctx)
 	s.startPeriodicReport(ctx)
 	s.logBootstrapSummary()
-	s.printConsoleHelp()
 	return s.publishStateReport("startup")
 }
 
@@ -277,7 +404,10 @@ func (s *simulator) pairDevice() error {
 	s.config.DeviceToken = payload.DeviceToken
 	s.bootstrap = payload.Bootstrap
 	log.Printf("配对成功，deviceId=%s deviceToken=%s", s.config.DeviceID, s.config.DeviceToken)
-	return s.saveConfig()
+	if err := s.saveConfig(); err != nil {
+		return err
+	}
+	return s.saveState()
 }
 
 func (s *simulator) fetchBootstrap() error {
@@ -298,7 +428,7 @@ func (s *simulator) fetchBootstrap() error {
 		return err
 	}
 	log.Printf("Bootstrap 成功，downlink=%s upstream=%s", s.bootstrap.DownlinkTopic, s.bootstrap.UpstreamTopic)
-	return nil
+	return s.saveState()
 }
 
 func (s *simulator) initializeChannels() {
@@ -307,6 +437,10 @@ func (s *simulator) initializeChannels() {
 
 	s.channels = map[string]*runtimeChannel{}
 	s.lastTimerRun = map[string]string{}
+	s.formulas = map[string]*formulaRuntime{}
+	s.scripts = map[string]*scriptRuntime{}
+	s.pwmRuntimes = map[string]*pwmRuntime{}
+	s.metrics = map[string]float64{}
 	capabilities := s.bootstrap.Device.Capabilities
 	if len(s.bootstrap.DriverInstances) > 0 {
 		capabilities = capabilitiesFromDriverInstances(s.bootstrap.DriverInstances)
@@ -315,6 +449,7 @@ func (s *simulator) initializeChannels() {
 		channel := &runtimeChannel{
 			TargetID: capability.ID,
 			Kind:     capability.Kind,
+			GPIO:     capability.GPIO,
 			Status:   "ok",
 		}
 		switch capability.Kind {
@@ -330,6 +465,68 @@ func (s *simulator) initializeChannels() {
 		}
 		s.channels[capability.ID] = channel
 	}
+	for _, item := range s.bootstrap.DriverInstances {
+		scriptProgram, err := loadScriptProgram(item.Config)
+		if err != nil {
+			log.Printf("[脚本] 跳过 target=%s，配置解析失败: %v", item.TargetID, err)
+			continue
+		}
+		if scriptProgram != nil {
+			runtime, err := newScriptRuntime(*scriptProgram, s)
+			if err != nil {
+				log.Printf("[脚本] 跳过 target=%s，初始化失败: %v", item.TargetID, err)
+				continue
+			}
+			s.scripts[item.TargetID] = runtime
+			log.Printf("[脚本] 已加载 target=%s init=%d loop=%d", item.TargetID, len(scriptProgram.init), len(scriptProgram.loop))
+			continue
+		}
+		program, err := loadFormulaProgram(item.Config)
+		if err != nil {
+			log.Printf("[公式] 跳过 target=%s，配置解析失败: %v", item.TargetID, err)
+			continue
+		}
+		if program == nil {
+			continue
+		}
+		s.formulas[item.TargetID] = newFormulaRuntime(item.TargetID, *program)
+		log.Printf("[公式] 已加载 target=%s rules=%d tickMs=%d", item.TargetID, len(program.Rules), program.TickMs)
+	}
+}
+
+func (s *simulator) restoreLastChannelState() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.lastReport.Channels) == 0 {
+		return
+	}
+	for targetID, saved := range s.lastReport.Channels {
+		channel := s.channels[targetID]
+		if channel == nil {
+			continue
+		}
+		switch channel.Kind {
+		case "relay":
+			channel.State = firstNonEmpty(saved.State, channel.State)
+			channel.Mode = firstNonEmpty(saved.Mode, channel.Mode)
+			channel.Status = firstNonEmpty(saved.Status, channel.Status)
+			_ = s.currentGPIOBackend().WriteRelay(channel.TargetID, channel.GPIO, channel.State)
+		case "mos_pwm":
+			channel.Duty = saved.Duty
+			channel.Mode = firstNonEmpty(saved.Mode, channel.Mode)
+			channel.Status = firstNonEmpty(saved.Status, channel.Status)
+			_ = s.currentGPIOBackend().WritePWM(channel.TargetID, channel.GPIO, channel.Duty)
+		case "sensor_temperature":
+			channel.TemperatureC = saved.TemperatureC
+			channel.Mode = firstNonEmpty(saved.Mode, channel.Mode)
+			channel.Status = firstNonEmpty(saved.Status, channel.Status)
+		}
+	}
+	if len(s.lastReport.Metrics) > 0 {
+		s.metrics = cloneMetrics(s.lastReport.Metrics)
+	}
+	log.Printf("已恢复本地运行状态: channels=%d", len(s.lastReport.Channels))
 }
 
 func capabilitiesFromDriverInstances(items []driverInstance) []capability {
@@ -340,25 +537,37 @@ func capabilitiesFromDriverInstances(items []driverInstance) []capability {
 			result = append(result, capability{
 				ID:           item.TargetID,
 				Kind:         "relay",
+				GPIO:         gpioFromBindings(item.GPIOBindings, "control"),
 				DefaultState: stringValue(item.Config, "defaultPowerOnState", "off"),
 			})
 		case "driver-mos-pwm-builtin":
 			result = append(result, capability{
 				ID:   item.TargetID,
 				Kind: "mos_pwm",
+				GPIO: gpioFromBindings(item.GPIOBindings, "pwm"),
 			})
 		case "driver-ds18b20-builtin":
 			result = append(result, capability{
 				ID:   item.TargetID,
 				Kind: "sensor_temperature",
+				GPIO: gpioFromBindings(item.GPIOBindings, "data"),
 			})
 		}
 	}
 	return result
 }
 
+func gpioFromBindings(bindings []gpioBinding, role string) int {
+	for _, item := range bindings {
+		if role == "" || item.PinRole == role {
+			return item.GPIO
+		}
+	}
+	return -1
+}
+
 func (s *simulator) startTimerLoop(ctx context.Context) {
-	s.timerTicker = time.NewTicker(time.Second)
+	s.timerTicker = time.NewTicker(50 * time.Millisecond)
 	go func() {
 		for {
 			select {
@@ -404,6 +613,233 @@ func (s *simulator) processTimers(now time.Time) {
 			}
 		}
 	}
+	s.processScripts(now)
+	s.processFormulas(now)
+	s.processPWMRuntimes(now)
+}
+
+func (s *simulator) processScripts(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for targetID, runtime := range s.scripts {
+		channel := s.channels[targetID]
+		if channel == nil || channel.Mode != "script" {
+			continue
+		}
+		if !runtime.shouldRun(now) {
+			continue
+		}
+		if err := runtime.executeTick(s, now); err != nil {
+			log.Printf("[脚本] target=%s 执行失败: %v", targetID, err)
+			channel.Status = "script_error"
+			continue
+		}
+		channel.Status = "ok"
+	}
+}
+
+func (s *simulator) processFormulas(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for targetID, runtime := range s.formulas {
+		if !runtime.shouldRun(now) {
+			continue
+		}
+		if err := runtime.execute(s, now); err != nil {
+			log.Printf("[公式] target=%s 执行失败: %v", targetID, err)
+			if channel := s.channels[targetID]; channel != nil {
+				channel.Status = "formula_error"
+			}
+			continue
+		}
+		if channel := s.channels[targetID]; channel != nil && channel.Mode == "" {
+			channel.Mode = "formula"
+		}
+	}
+}
+
+func (s *simulator) processPWMRuntimes(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for targetID, runtime := range s.pwmRuntimes {
+		if runtime == nil || runtime.Completed {
+			continue
+		}
+		channel := s.channels[targetID]
+		if channel == nil || channel.Kind != "mos_pwm" {
+			continue
+		}
+		duty, done := runtime.nextDuty(channel, now)
+		if duty != channel.Duty || channel.Mode != runtime.Mode {
+			if err := s.writePWM(channel, duty, runtime.Mode); err != nil {
+				log.Printf("[造浪] target=%s 写 PWM 失败: %v", targetID, err)
+				channel.Status = "pwm_error"
+				continue
+			}
+		}
+		if done {
+			runtime.Completed = true
+		}
+	}
+}
+
+func (r *pwmRuntime) nextDuty(channel *runtimeChannel, now time.Time) (int, bool) {
+	elapsed := now.Sub(r.StartedAt)
+	switch r.Mode {
+	case "linearRamp":
+		fromDuty := intValue(r.Params, "from", channel.Duty)
+		toDuty := intValue(r.Params, "to", channel.Duty)
+		durationMs := maxInt(intValue(r.Params, "durationMs", 1000), 1)
+		loop := loopCountValue(r.Params)
+		progress := float64(elapsed.Milliseconds()) / float64(durationMs)
+		if loop != 0 {
+			cycle := math.Mod(progress, 2)
+			if cycle > 1 {
+				progress = 2 - cycle
+			} else {
+				progress = cycle
+			}
+		}
+		progress = clampFloat(progress, 0, 1)
+		duty := roundInt(float64(fromDuty) + float64(toDuty-fromDuty)*progress)
+		if loop < 0 {
+			return duty, false
+		}
+		return duty, elapsed.Milliseconds() >= int64(durationMs*(loop+1))
+	case "curveWave":
+		fromDuty := intValue(r.Params, "from", channel.Duty)
+		toDuty := intValue(r.Params, "to", channel.Duty)
+		control1 := intValue(r.Params, "control1", toDuty)
+		control2 := intValue(r.Params, "control2", fromDuty)
+		durationMs := maxInt(intValue(r.Params, "durationMs", 3000), 1)
+		curve := stringValue(r.Params, "curve", "linear")
+		direction := directionValue(r.Params, "once")
+		loop := loopCountValue(r.Params)
+		phase := float64(elapsed.Milliseconds()) / float64(durationMs)
+		cycleSpan := 1.0
+		if direction == "pingpong" {
+			cycleSpan = 2
+		}
+		local := phase
+		if loop != 0 {
+			local = math.Mod(phase, cycleSpan)
+		}
+		if direction == "pingpong" {
+			if local > 1 {
+				local = 2 - local
+			}
+		} else {
+			local = clampFloat(local, 0, 1)
+		}
+		eased := curveProgress(local, curve, fromDuty, control1, control2, toDuty)
+		duty := roundInt(float64(fromDuty) + float64(toDuty-fromDuty)*eased)
+		if loop < 0 {
+			return duty, false
+		}
+		return duty, phase >= cycleSpan*float64(loop+1)
+	case "sineWave":
+		minDuty := intValue(r.Params, "minDuty", 0)
+		maxDuty := intValue(r.Params, "maxDuty", 1000)
+		periodMs := maxInt(intValue(r.Params, "periodMs", 2500), 1)
+		loop := loopCountValue(r.Params)
+		progress := float64(elapsed.Milliseconds()) / float64(periodMs)
+		cycles := progress
+		if loop == 0 && progress >= 1 {
+			cycles = 1
+		}
+		phase := cycles * 2 * math.Pi
+		value := (math.Sin(phase-math.Pi/2) + 1) / 2
+		duty := roundInt(float64(minDuty) + float64(maxDuty-minDuty)*value)
+		if loop < 0 {
+			return duty, false
+		}
+		return duty, progress >= float64(loop+1)
+	case "bezierWave":
+		fromDuty := intValue(r.Params, "from", channel.Duty)
+		toDuty := intValue(r.Params, "to", channel.Duty)
+		control1 := intValue(r.Params, "control1", toDuty)
+		control2 := intValue(r.Params, "control2", fromDuty)
+		durationMs := maxInt(intValue(r.Params, "durationMs", 3000), 1)
+		loop := loopCountValue(r.Params)
+		progress := float64(elapsed.Milliseconds()) / float64(durationMs)
+		if loop != 0 {
+			progress = progress - math.Floor(progress)
+		} else {
+			progress = clampFloat(progress, 0, 1)
+		}
+		value := cubicBezier(progress, float64(fromDuty), float64(control1), float64(control2), float64(toDuty))
+		if loop < 0 {
+			return roundInt(value), false
+		}
+		return roundInt(value), elapsed.Milliseconds() >= int64(durationMs*(loop+1))
+	case "randomWave":
+		minDuty := intValue(r.Params, "minDuty", 0)
+		maxDuty := intValue(r.Params, "maxDuty", 1000)
+		intervalMs := maxInt(intValue(r.Params, "intervalMs", 1200), 1)
+		smoothing := clampFloat(float64(intValue(r.Params, "smoothing", 35))/100, 0.01, 1)
+		loop := loopCountValue(r.Params)
+		if r.LastRunAt.IsZero() {
+			r.LastRunAt = now
+			r.RandomDuty = minDuty
+			r.CurrentDuty = float64(channel.Duty)
+		}
+		if now.Sub(r.LastRunAt) >= time.Duration(intervalMs)*time.Millisecond {
+			r.LastRunAt = now
+			r.RandomDuty = r.nextRandomDuty(minDuty, maxDuty)
+		}
+		r.CurrentDuty += (float64(r.RandomDuty) - r.CurrentDuty) * smoothing
+		if loop < 0 {
+			return roundInt(r.CurrentDuty), false
+		}
+		done := elapsed.Milliseconds() >= int64(intervalMs*(loop+1))
+		return roundInt(r.CurrentDuty), done
+	case "pulseWave":
+		lowDuty := intValue(r.Params, "lowDuty", 0)
+		highDuty := intValue(r.Params, "highDuty", 1000)
+		onDurationMs := maxInt(intValue(r.Params, "onDurationMs", 800), 1)
+		offDurationMs := maxInt(intValue(r.Params, "offDurationMs", 1200), 1)
+		loop := loopCountValue(r.Params)
+		cycleMs := onDurationMs + offDurationMs
+		totalMs := elapsed.Milliseconds()
+		if loop == 0 && totalMs >= int64(cycleMs) {
+			return lowDuty, true
+		}
+		if loop > 0 && totalMs >= int64(cycleMs*(loop+1)) {
+			return lowDuty, true
+		}
+		phaseMs := int(totalMs % int64(cycleMs))
+		if phaseMs < onDurationMs {
+			return highDuty, false
+		}
+		return lowDuty, false
+	default:
+		return channel.Duty, true
+	}
+}
+
+func (r *pwmRuntime) nextRandomDuty(minDuty int, maxDuty int) int {
+	if maxDuty <= minDuty {
+		return minDuty
+	}
+	if r.RandomSeed == 0 {
+		r.RandomSeed = uint64(time.Now().UnixNano()) ^ 0x9e3779b97f4a7c15
+	}
+	r.RandomSeed ^= r.RandomSeed << 13
+	r.RandomSeed ^= r.RandomSeed >> 7
+	r.RandomSeed ^= r.RandomSeed << 17
+	span := maxDuty - minDuty + 1
+	return minDuty + int(r.RandomSeed%uint64(span))
+}
+
+func roundInt(value float64) int {
+	return int(math.Round(value))
+}
+
+func maxInt(a int, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func (s *simulator) commandFromTimer(targetID string, action timerAction) driverCommand {
@@ -430,11 +866,21 @@ func (s *simulator) commandFromTimer(targetID string, action timerAction) driver
 	switch mode {
 	case "direct":
 		params["duty"] = action.Duty
+	case "curveWave":
+		params["from"] = action.From
+		params["to"] = action.To
+		params["control1"] = action.Control1
+		params["control2"] = action.Control2
+		params["durationMs"] = action.DurationMs
+		params["curve"] = action.Curve
+		params["direction"] = action.Direction
+		params["loop"] = action.Loop
 	case "linearRamp":
 		params["from"] = action.From
 		params["to"] = action.To
 		params["durationMs"] = action.DurationMs
 		params["curve"] = action.Curve
+		params["loop"] = action.Loop
 	case "sineWave":
 		params["minDuty"] = action.MinDuty
 		params["maxDuty"] = action.MaxDuty
@@ -459,6 +905,7 @@ func (s *simulator) commandFromTimer(targetID string, action timerAction) driver
 		params["onDurationMs"] = action.OnDurationMs
 		params["offDurationMs"] = action.OffDurationMs
 		params["loop"] = action.Loop
+	case "script":
 	case "maxPower":
 		mode = "direct"
 		params["duty"] = 1000
@@ -494,6 +941,8 @@ func functionToMode(function string) string {
 		return "sineWave"
 	case "randomWave":
 		return "randomWave"
+	case "curveWave":
+		return "curveWave"
 	case "toggle":
 		return "toggle"
 	default:
@@ -599,13 +1048,26 @@ func (s *simulator) handleMQTTMessage(_ mqttclient.Client, message mqttclient.Me
 }
 
 func (s *simulator) applyCommand(command driverCommand) error {
+	if command.Kind == "system" {
+		switch command.Operation {
+		case "reportState":
+			log.Printf("[系统] 触发状态查询")
+			return nil
+		case "bootstrapRefresh":
+			log.Printf("[系统] 触发 bootstrap 刷新")
+			if err := s.fetchBootstrap(); err != nil {
+				return err
+			}
+			s.initializeChannels()
+			return nil
+		default:
+			log.Printf("[忽略] 未支持的系统命令 operation=%s", command.Operation)
+			return nil
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if command.Kind == "system" && command.Operation == "reportState" {
-		log.Printf("[系统] 触发状态查询")
-		return nil
-	}
 
 	switch command.Kind {
 	case "relay":
@@ -627,16 +1089,18 @@ func (s *simulator) applyRelayCommand(command driverCommand) error {
 	}
 	switch command.Operation {
 	case "switch":
-		channel.State = stringValue(command.Params, "state", "off")
-		channel.Mode = "switch"
+		if err := s.writeRelay(channel, stringValue(command.Params, "state", "off"), "switch"); err != nil {
+			return err
+		}
 		log.Printf("[继电器] %s -> %s", command.TargetID, channel.State)
 	case "toggle":
+		nextState := "on"
 		if channel.State == "on" {
-			channel.State = "off"
-		} else {
-			channel.State = "on"
+			nextState = "off"
 		}
-		channel.Mode = "toggle"
+		if err := s.writeRelay(channel, nextState, "toggle"); err != nil {
+			return err
+		}
 		log.Printf("[继电器] %s toggle -> %s", command.TargetID, channel.State)
 	default:
 		log.Printf("[继电器] 未支持操作 %s", command.Operation)
@@ -651,63 +1115,127 @@ func (s *simulator) applyPWMCommand(command driverCommand) error {
 	}
 	switch command.Operation {
 	case "direct":
-		channel.Duty = intValue(command.Params, "duty", 0)
-		channel.Mode = "direct"
+		delete(s.pwmRuntimes, command.TargetID)
+		if err := s.writePWM(channel, intValue(command.Params, "duty", 0), "direct"); err != nil {
+			return err
+		}
 		log.Printf("[造浪] %s 定速 duty=%d", command.TargetID, channel.Duty)
+	case "curveWave":
+		fromDuty := intValue(command.Params, "from", channel.Duty)
+		toDuty := intValue(command.Params, "to", channel.Duty)
+		durationMs := intValue(command.Params, "durationMs", 3000)
+		s.pwmRuntimes[command.TargetID] = &pwmRuntime{
+			Mode:      "curveWave",
+			Params:    cloneParams(command.Params),
+			StartedAt: time.Now().UTC(),
+		}
+		if err := s.writePWM(channel, fromDuty, "curveWave"); err != nil {
+			return err
+		}
+		log.Printf("[造浪] %s 曲线波 %d -> %d duration=%dms curve=%s direction=%s loop=%d",
+			command.TargetID,
+			fromDuty,
+			toDuty,
+			durationMs,
+			stringValue(command.Params, "curve", "linear"),
+			directionValue(command.Params, "once"),
+			loopCountValue(command.Params),
+		)
 	case "linearRamp":
 		fromDuty := intValue(command.Params, "from", channel.Duty)
 		toDuty := intValue(command.Params, "to", channel.Duty)
 		durationMs := intValue(command.Params, "durationMs", 1000)
-		channel.Duty = toDuty
-		channel.Mode = "linearRamp"
-		log.Printf("[造浪] %s 线性变速 %d -> %d duration=%dms", command.TargetID, fromDuty, toDuty, durationMs)
+		s.pwmRuntimes[command.TargetID] = &pwmRuntime{
+			Mode:      "linearRamp",
+			Params:    cloneParams(command.Params),
+			StartedAt: time.Now().UTC(),
+		}
+		if err := s.writePWM(channel, fromDuty, "linearRamp"); err != nil {
+			return err
+		}
+		log.Printf("[造浪] %s 线性变速 %d -> %d duration=%dms loop=%d", command.TargetID, fromDuty, toDuty, durationMs, loopCountValue(command.Params))
 	case "sineWave":
-		channel.Duty = intValue(command.Params, "maxDuty", channel.Duty)
-		channel.Mode = "sineWave"
-		log.Printf("[造浪] %s 正弦波 min=%d max=%d period=%dms loop=%v",
+		s.pwmRuntimes[command.TargetID] = &pwmRuntime{
+			Mode:      "sineWave",
+			Params:    cloneParams(command.Params),
+			StartedAt: time.Now().UTC(),
+		}
+		if err := s.writePWM(channel, intValue(command.Params, "minDuty", channel.Duty), "sineWave"); err != nil {
+			return err
+		}
+		log.Printf("[造浪] %s 正弦波 min=%d max=%d period=%dms loop=%d",
 			command.TargetID,
 			intValue(command.Params, "minDuty", 0),
 			intValue(command.Params, "maxDuty", channel.Duty),
 			intValue(command.Params, "periodMs", 2500),
-			boolValue(command.Params, "loop", false),
+			loopCountValue(command.Params),
 		)
 	case "bezierWave":
-		channel.Duty = intValue(command.Params, "to", channel.Duty)
-		channel.Mode = "bezierWave"
-		log.Printf("[造浪] %s 贝塞尔波 from=%d c1=%d c2=%d to=%d duration=%dms loop=%v",
+		s.pwmRuntimes[command.TargetID] = &pwmRuntime{
+			Mode:      "bezierWave",
+			Params:    cloneParams(command.Params),
+			StartedAt: time.Now().UTC(),
+		}
+		if err := s.writePWM(channel, intValue(command.Params, "from", channel.Duty), "bezierWave"); err != nil {
+			return err
+		}
+		log.Printf("[造浪] %s 贝塞尔波 from=%d c1=%d c2=%d to=%d duration=%dms loop=%d",
 			command.TargetID,
 			intValue(command.Params, "from", 0),
 			intValue(command.Params, "control1", 0),
 			intValue(command.Params, "control2", 0),
 			intValue(command.Params, "to", channel.Duty),
 			intValue(command.Params, "durationMs", 3000),
-			boolValue(command.Params, "loop", false),
+			loopCountValue(command.Params),
 		)
 	case "randomWave":
-		channel.Duty = intValue(command.Params, "maxDuty", channel.Duty)
-		channel.Mode = "randomWave"
-		log.Printf("[造浪] %s 随机波 min=%d max=%d interval=%dms smoothing=%d loop=%v",
+		s.pwmRuntimes[command.TargetID] = &pwmRuntime{
+			Mode:        "randomWave",
+			Params:      cloneParams(command.Params),
+			StartedAt:   time.Now().UTC(),
+			CurrentDuty: float64(channel.Duty),
+		}
+		if err := s.writePWM(channel, intValue(command.Params, "minDuty", channel.Duty), "randomWave"); err != nil {
+			return err
+		}
+		log.Printf("[造浪] %s 随机波 min=%d max=%d interval=%dms smoothing=%d loop=%d",
 			command.TargetID,
 			intValue(command.Params, "minDuty", 0),
 			intValue(command.Params, "maxDuty", channel.Duty),
 			intValue(command.Params, "intervalMs", 1200),
 			intValue(command.Params, "smoothing", 0),
-			boolValue(command.Params, "loop", false),
+			loopCountValue(command.Params),
 		)
 	case "pulseWave":
-		channel.Duty = intValue(command.Params, "highDuty", channel.Duty)
-		channel.Mode = "pulseWave"
-		log.Printf("[造浪] %s 脉冲波 low=%d high=%d on=%dms off=%dms loop=%v",
+		s.pwmRuntimes[command.TargetID] = &pwmRuntime{
+			Mode:      "pulseWave",
+			Params:    cloneParams(command.Params),
+			StartedAt: time.Now().UTC(),
+		}
+		if err := s.writePWM(channel, intValue(command.Params, "highDuty", channel.Duty), "pulseWave"); err != nil {
+			return err
+		}
+		log.Printf("[造浪] %s 脉冲波 low=%d high=%d on=%dms off=%dms loop=%d",
 			command.TargetID,
 			intValue(command.Params, "lowDuty", 0),
 			intValue(command.Params, "highDuty", channel.Duty),
 			intValue(command.Params, "onDurationMs", 800),
 			intValue(command.Params, "offDurationMs", 1200),
-			boolValue(command.Params, "loop", false),
+			loopCountValue(command.Params),
 		)
+	case "script":
+		delete(s.pwmRuntimes, command.TargetID)
+		if s.scripts[command.TargetID] == nil {
+			return fmt.Errorf("PWM 通道 %s 未配置脚本", command.TargetID)
+		}
+		channel.Mode = "script"
+		channel.Status = "ok"
+		log.Printf("[造浪] %s 切换到脚本驱动", command.TargetID)
 	case "stop":
-		channel.Duty = 0
-		channel.Mode = "stop"
+		delete(s.pwmRuntimes, command.TargetID)
+		if err := s.writePWM(channel, 0, "stop"); err != nil {
+			return err
+		}
 		log.Printf("[造浪] %s 停止输出", command.TargetID)
 	default:
 		log.Printf("[造浪] 未支持操作 %s", command.Operation)
@@ -721,7 +1249,7 @@ func (s *simulator) applyGroupCommand(command driverCommand) error {
 		log.Printf("[分组] channels 参数为空")
 		return nil
 	}
-	log.Printf("[分组] sequenceGroup channels=%d loop=%v", len(channels), boolValue(command.Params, "loop", false))
+	log.Printf("[分组] sequenceGroup channels=%d loop=%d", len(channels), loopCountValue(command.Params))
 	for _, item := range channels {
 		channelMap, ok := item.(map[string]any)
 		if !ok {
@@ -733,11 +1261,60 @@ func (s *simulator) applyGroupCommand(command driverCommand) error {
 			continue
 		}
 		steps := stepList(channelMap["steps"])
-		channel.Duty = finalDutyFromSteps(steps, channel.Duty)
-		channel.Mode = "sequenceGroup"
+		if err := s.writePWM(channel, finalDutyFromSteps(steps, channel.Duty), "sequenceGroup"); err != nil {
+			return err
+		}
 		log.Printf("[分组] %s finalDuty=%d steps=%d", targetID, channel.Duty, len(steps))
 	}
 	return nil
+}
+
+func (s *simulator) currentGPIOBackend() gpioBackend {
+	if s.gpioBackend != nil {
+		return s.gpioBackend
+	}
+	return consoleGPIOBackend{}
+}
+
+func (s *simulator) writePWM(channel *runtimeChannel, duty int, mode string) error {
+	if channel == nil {
+		return fmt.Errorf("pwm channel is nil")
+	}
+	if err := s.currentGPIOBackend().WritePWM(channel.TargetID, channel.GPIO, duty); err != nil {
+		return err
+	}
+	channel.Duty = duty
+	if mode != "" {
+		channel.Mode = mode
+	}
+	channel.Status = "ok"
+	return nil
+}
+
+func (s *simulator) writeRelay(channel *runtimeChannel, state string, mode string) error {
+	if channel == nil {
+		return fmt.Errorf("relay channel is nil")
+	}
+	if err := s.currentGPIOBackend().WriteRelay(channel.TargetID, channel.GPIO, state); err != nil {
+		return err
+	}
+	channel.State = state
+	if mode != "" {
+		channel.Mode = mode
+	}
+	channel.Status = "ok"
+	return nil
+}
+
+func cloneParams(input map[string]any) map[string]any {
+	if len(input) == 0 {
+		return map[string]any{}
+	}
+	result := make(map[string]any, len(input))
+	for key, value := range input {
+		result[key] = value
+	}
+	return result
 }
 
 func (s *simulator) startPeriodicReport(ctx context.Context) {
@@ -775,6 +1352,7 @@ func (s *simulator) updateSensorValues() {
 
 func (s *simulator) publishStateReport(reason string) error {
 	report := s.buildStateReport()
+	s.lastReport = report
 	payload, err := json.Marshal(report)
 	if err != nil {
 		return err
@@ -807,7 +1385,7 @@ func (s *simulator) publishStateReport(reason string) error {
 	if response.StatusCode != http.StatusOK {
 		return decodeHTTPError(response)
 	}
-	return nil
+	return s.saveState()
 }
 
 func (s *simulator) buildStateReport() deviceStateReport {
@@ -843,6 +1421,7 @@ func (s *simulator) buildStateReport() deviceStateReport {
 		Rssi:       0,
 		UptimeMs:   uint64(time.Since(s.startedAt).Milliseconds()),
 		Channels:   channels,
+		Metrics:    cloneMetrics(s.metrics),
 		LastError:  "",
 		ReportedAt: time.Now().UTC().Format(time.RFC3339),
 	}
@@ -856,8 +1435,19 @@ func (s *simulator) logBootstrapSummary() {
 		return
 	}
 	for _, item := range s.bootstrap.DriverInstances {
-		log.Printf("驱动实例 id=%s target=%s def=%s", item.ID, item.TargetID, item.DriverDefinitionID)
+		scriptState := "no-script"
+		if source, ok := item.Config["scriptSource"].(string); ok && strings.TrimSpace(source) != "" {
+			scriptState = "script-saved"
+		}
+		log.Printf("驱动实例 id=%s target=%s def=%s code=%s", item.ID, item.TargetID, item.DriverDefinitionID, scriptState)
 	}
+}
+
+func (s *simulator) hasSavedBootstrap() bool {
+	if s.bootstrap.Device.DeviceID != "" {
+		return true
+	}
+	return len(s.bootstrap.DriverInstances) > 0 || len(s.bootstrap.Device.Capabilities) > 0
 }
 
 func (s *simulator) saveConfig() error {
@@ -872,6 +1462,56 @@ func (s *simulator) saveConfig() error {
 		}
 	}
 	return os.WriteFile(s.configPath, data, 0o644)
+}
+
+func (s *simulator) loadSavedState() error {
+	if s.statePath == "" {
+		return nil
+	}
+	data, err := os.ReadFile(s.statePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var state simulatorState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return err
+	}
+	if state.StateVersion == 0 {
+		state.StateVersion = 1
+	}
+	if state.Bootstrap.Device.DeviceID == "" && len(state.Bootstrap.DriverInstances) == 0 {
+		return nil
+	}
+	s.bootstrap = state.Bootstrap
+	s.lastReport = state.LastReport
+	log.Printf("已加载本地仿真状态: drivers=%d savedAt=%s", len(state.Bootstrap.DriverInstances), state.SavedAt)
+	return nil
+}
+
+func (s *simulator) saveState() error {
+	if s.statePath == "" {
+		return nil
+	}
+	state := simulatorState{
+		StateVersion: 1,
+		Bootstrap:    s.bootstrap,
+		LastReport:   s.lastReport,
+		SavedAt:      time.Now().UTC().Format(time.RFC3339),
+	}
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(s.statePath)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	return os.WriteFile(s.statePath, data, 0o644)
 }
 
 func (s *simulator) close() {
@@ -922,23 +1562,6 @@ func (s *simulator) executeConsoleCommand(line string) error {
 		s.printTimers()
 	case "report":
 		return s.publishStateReport("console")
-	case "bootstrap":
-		if err := s.fetchBootstrap(); err != nil {
-			return err
-		}
-		s.initializeChannels()
-		log.Printf("[控制台] 已重新拉取 bootstrap")
-		return s.publishStateReport("console-bootstrap")
-	case "setup":
-		oldToken := s.config.DeviceToken
-		if err := s.setupWizard(true); err != nil {
-			return err
-		}
-		if oldToken != s.config.DeviceToken {
-			log.Printf("[控制台] 配置已更新，下次启动会按新设备状态处理")
-			return nil
-		}
-		return s.publishStateReport("console-setup")
 	case "relay":
 		if len(parts) < 3 {
 			return fmt.Errorf("用法: relay <targetId> <on|off|toggle>")
@@ -972,7 +1595,7 @@ func (s *simulator) executeConsoleCommand(line string) error {
 		return s.publishStateReport("console-pwm")
 	case "wave":
 		if len(parts) < 3 {
-			return fmt.Errorf("用法: wave <targetId> <direct|linearRamp|sineWave|bezierWave|randomWave|pulseWave|stop>")
+			return fmt.Errorf("用法: wave <targetId> <direct|curveWave|linearRamp|sineWave|bezierWave|randomWave|pulseWave|stop>")
 		}
 		command, err := buildWaveConsoleCommand(parts)
 		if err != nil {
@@ -1023,6 +1646,13 @@ func buildWaveConsoleCommand(parts []string) (driverCommand, error) {
 		if len(parts) >= 4 {
 			command.Params["duty"] = parseInt(parts[3], 700)
 		}
+	case "curveWave":
+		command.Params["from"] = 220
+		command.Params["to"] = 820
+		command.Params["durationMs"] = 3000
+		command.Params["curve"] = "easeInOut"
+		command.Params["direction"] = "pingpong"
+		command.Params["loop"] = -1
 	case "linearRamp":
 		command.Params["from"] = 220
 		command.Params["to"] = 820
@@ -1031,26 +1661,26 @@ func buildWaveConsoleCommand(parts []string) (driverCommand, error) {
 		command.Params["minDuty"] = 240
 		command.Params["maxDuty"] = 820
 		command.Params["periodMs"] = 2500
-		command.Params["loop"] = true
+		command.Params["loop"] = -1
 	case "bezierWave":
 		command.Params["from"] = 220
 		command.Params["to"] = 820
 		command.Params["control1"] = 760
 		command.Params["control2"] = 320
 		command.Params["durationMs"] = 3000
-		command.Params["loop"] = true
+		command.Params["loop"] = -1
 	case "randomWave":
 		command.Params["minDuty"] = 260
 		command.Params["maxDuty"] = 880
 		command.Params["intervalMs"] = 1200
 		command.Params["smoothing"] = 35
-		command.Params["loop"] = true
+		command.Params["loop"] = -1
 	case "pulseWave":
 		command.Params["lowDuty"] = 260
 		command.Params["highDuty"] = 860
 		command.Params["onDurationMs"] = 800
 		command.Params["offDurationMs"] = 1200
-		command.Params["loop"] = true
+		command.Params["loop"] = -1
 	case "stop":
 	default:
 		return driverCommand{}, fmt.Errorf("不支持的造浪模式: %s", mode)
@@ -1100,24 +1730,18 @@ func (s *simulator) printChannelStatus() {
 func (s *simulator) printConsoleHelp() {
 	log.Println("[控制台] 可用命令:")
 	log.Println("[控制台]   help")
-	log.Println("[控制台]   setup")
 	log.Println("[控制台]   status")
 	log.Println("[控制台]   timers")
 	log.Println("[控制台]   report")
-	log.Println("[控制台]   bootstrap")
 	log.Println("[控制台]   relay <targetId> <on|off|toggle>")
 	log.Println("[控制台]   pwm <targetId> <duty>")
-	log.Println("[控制台]   wave <targetId> <direct|linearRamp|sineWave|bezierWave|randomWave|pulseWave|stop>")
+	log.Println("[控制台]   wave <targetId> <direct|curveWave|linearRamp|sineWave|bezierWave|randomWave|pulseWave|stop>")
 	log.Println("[控制台]   temp <targetId> <value>")
 	log.Println("[控制台]   command <json>")
 	log.Println("[控制台]   quit")
 }
 
-func (s *simulator) ensureInteractiveConfig() error {
-	return s.setupWizard(false)
-}
-
-func (s *simulator) setupWizard(force bool) error {
+func (s *simulator) prepareConfig() error {
 	changed := false
 	if s.config.DeviceID == "" {
 		s.config.DeviceID = randomDeviceID()
@@ -1139,40 +1763,9 @@ func (s *simulator) setupWizard(force bool) error {
 		s.config.ConfigVersion = 1
 		changed = true
 	}
-
-	if force || s.config.APIBaseURL == "" {
-		value, err := promptLine("请输入后端地址", firstNonEmpty(s.config.APIBaseURL, "http://localhost:8080"))
-		if err != nil {
-			return err
-		}
-		s.config.APIBaseURL = value
+	if s.config.APIBaseURL == "" {
+		s.config.APIBaseURL = "http://localhost:8080"
 		changed = true
-	}
-
-	if force {
-		deviceID, err := promptLine("请输入设备 ID", s.config.DeviceID)
-		if err != nil {
-			return err
-		}
-		if deviceID != s.config.DeviceID {
-			s.config.DeviceID = deviceID
-			s.config.ClientID = "device-sim-" + s.config.DeviceID
-			s.config.DeviceToken = ""
-			changed = true
-		}
-
-		platform, err := promptLine("请输入平台", firstNonEmpty(s.config.Platform, "esp32"))
-		if err != nil {
-			return err
-		}
-		if platform == "" {
-			platform = "esp32"
-		}
-		if platform != s.config.Platform {
-			s.config.Platform = platform
-			s.config.DeviceToken = ""
-			changed = true
-		}
 	}
 
 	if changed {
@@ -1183,7 +1776,7 @@ func (s *simulator) setupWizard(force bool) error {
 
 func loadSimulatorConfig(configPath string) (simulatorConfig, error) {
 	defaultConfig := simulatorConfig{
-		APIBaseURL:        "",
+		APIBaseURL:        "http://localhost:8080",
 		DeviceID:          randomDeviceID(),
 		Platform:          "esp32",
 		ReportIntervalSec: 30,
@@ -1217,6 +1810,9 @@ func loadSimulatorConfig(configPath string) (simulatorConfig, error) {
 	}
 	if config.ClientID == "" {
 		config.ClientID = "device-sim-" + config.DeviceID
+	}
+	if config.APIBaseURL == "" {
+		config.APIBaseURL = "http://localhost:8080"
 	}
 	if config.ConfigVersion == 0 {
 		config.ConfigVersion = 1
@@ -1282,6 +1878,17 @@ func decodeHTTPError(response *http.Response) error {
 		}
 	}
 	return fmt.Errorf("HTTP %d", response.StatusCode)
+}
+
+func cloneMetrics(values map[string]float64) map[string]float64 {
+	if len(values) == 0 {
+		return nil
+	}
+	result := make(map[string]float64, len(values))
+	for key, value := range values {
+		result[key] = value
+	}
+	return result
 }
 
 func stringValue(values map[string]any, key string, fallback string) string {
