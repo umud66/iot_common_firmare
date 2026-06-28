@@ -1,4 +1,4 @@
-#include <Arduino_JSON.h>
+#include <ArduinoJson.h>
 
 #include "device_config.h"
 
