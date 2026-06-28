@@ -373,11 +373,112 @@ func (r *scriptRuntime) callFunction(s *simulator, name string, args []scriptExp
 			return nil, r.writePWM(s, values[0], values[1])
 		}
 		return asFloat(values[1]), nil
+	case "pwm_direct":
+		if statementOnly {
+			return nil, r.startPWMScriptRuntime(s, values[0], "direct", map[string]any{
+				"duty": int(math.Round(asFloat(values[1]))),
+			})
+		}
+		return asFloat(values[1]), nil
+	case "pwm_linear":
+		if statementOnly {
+			return nil, r.startPWMScriptRuntime(s, values[0], "linearRamp", map[string]any{
+				"from":       int(math.Round(asFloat(values[1]))),
+				"to":         int(math.Round(asFloat(values[2]))),
+				"durationMs": int(math.Round(asFloat(values[3]))),
+				"loop":       int(math.Round(asFloat(values[4]))),
+			})
+		}
+		return nil, nil
+	case "pwm_curve":
+		if statementOnly {
+			return nil, r.startPWMScriptRuntime(s, values[0], "curveWave", map[string]any{
+				"from":       int(math.Round(asFloat(values[1]))),
+				"to":         int(math.Round(asFloat(values[2]))),
+				"durationMs": int(math.Round(asFloat(values[3]))),
+				"curve":      asString(values[4]),
+				"direction":  asString(values[5]),
+				"loop":       int(math.Round(asFloat(values[6]))),
+			})
+		}
+		return nil, nil
+	case "pwm_sine":
+		if statementOnly {
+			return nil, r.startPWMScriptRuntime(s, values[0], "sineWave", map[string]any{
+				"minDuty":  int(math.Round(asFloat(values[1]))),
+				"maxDuty":  int(math.Round(asFloat(values[2]))),
+				"periodMs": int(math.Round(asFloat(values[3]))),
+				"loop":     int(math.Round(asFloat(values[4]))),
+			})
+		}
+		return nil, nil
+	case "pwm_bezier":
+		if statementOnly {
+			return nil, r.startPWMScriptRuntime(s, values[0], "bezierWave", map[string]any{
+				"from":       int(math.Round(asFloat(values[1]))),
+				"control1":   int(math.Round(asFloat(values[2]))),
+				"control2":   int(math.Round(asFloat(values[3]))),
+				"to":         int(math.Round(asFloat(values[4]))),
+				"durationMs": int(math.Round(asFloat(values[5]))),
+				"loop":       int(math.Round(asFloat(values[6]))),
+			})
+		}
+		return nil, nil
+	case "pwm_random":
+		if statementOnly {
+			return nil, r.startPWMScriptRuntime(s, values[0], "randomWave", map[string]any{
+				"minDuty":    int(math.Round(asFloat(values[1]))),
+				"maxDuty":    int(math.Round(asFloat(values[2]))),
+				"intervalMs": int(math.Round(asFloat(values[3]))),
+				"smoothing":  int(math.Round(asFloat(values[4]))),
+				"loop":       int(math.Round(asFloat(values[5]))),
+			})
+		}
+		return nil, nil
+	case "pwm_pulse":
+		if statementOnly {
+			return nil, r.startPWMScriptRuntime(s, values[0], "pulseWave", map[string]any{
+				"lowDuty":       int(math.Round(asFloat(values[1]))),
+				"highDuty":      int(math.Round(asFloat(values[2]))),
+				"onDurationMs":  int(math.Round(asFloat(values[3]))),
+				"offDurationMs": int(math.Round(asFloat(values[4]))),
+				"loop":          int(math.Round(asFloat(values[5]))),
+			})
+		}
+		return nil, nil
+	case "pwm_stop":
+		if statementOnly {
+			return nil, r.startPWMScriptRuntime(s, values[0], "stop", nil)
+		}
+		return nil, nil
 	case "relay":
 		if statementOnly {
 			return nil, r.writeRelay(s, values[0], values[1])
 		}
 		return values[1], nil
+	case "relay_on":
+		if statementOnly {
+			return nil, r.writeRelay(s, values[0], "on")
+		}
+		return "on", nil
+	case "relay_off":
+		if statementOnly {
+			return nil, r.writeRelay(s, values[0], "off")
+		}
+		return "off", nil
+	case "relay_toggle":
+		if statementOnly {
+			channel := s.channels[asString(values[0])]
+			if channel == nil {
+				return nil, fmt.Errorf("unknown relay target %s", asString(values[0]))
+			}
+			nextState := "on"
+			if channel.State == "on" {
+				nextState = "off"
+			}
+			return nil, r.writeRelay(s, values[0], nextState)
+		}
+		return nil, nil
 	case "metric":
 		if statementOnly {
 			return nil, r.writeMetric(s, values[0], values[1])
@@ -392,6 +493,50 @@ func (r *scriptRuntime) callFunction(s *simulator, name string, args []scriptExp
 		return nil, fmt.Errorf("sleep 只能作为独立语句使用")
 	default:
 		return nil, fmt.Errorf("unsupported function %s", name)
+	}
+}
+
+func (r *scriptRuntime) startPWMScriptRuntime(s *simulator, target any, mode string, params map[string]any) error {
+	targetID := asString(target)
+	channel := s.channels[targetID]
+	if channel == nil {
+		return fmt.Errorf("unknown pwm target %s", targetID)
+	}
+	if s.pwmRuntimes == nil {
+		s.pwmRuntimes = map[string]*pwmRuntime{}
+	}
+	switch mode {
+	case "direct":
+		delete(s.pwmRuntimes, targetID)
+		return s.writePWM(channel, intValue(params, "duty", channel.Duty), "direct")
+	case "stop":
+		delete(s.pwmRuntimes, targetID)
+		return s.writePWM(channel, 0, "stop")
+	case "linearRamp":
+		s.pwmRuntimes[targetID] = &pwmRuntime{Mode: "linearRamp", Params: cloneParams(params), StartedAt: time.Now().UTC()}
+		return s.writePWM(channel, intValue(params, "from", channel.Duty), "linearRamp")
+	case "curveWave":
+		s.pwmRuntimes[targetID] = &pwmRuntime{Mode: "curveWave", Params: cloneParams(params), StartedAt: time.Now().UTC()}
+		return s.writePWM(channel, intValue(params, "from", channel.Duty), "curveWave")
+	case "sineWave":
+		s.pwmRuntimes[targetID] = &pwmRuntime{Mode: "sineWave", Params: cloneParams(params), StartedAt: time.Now().UTC()}
+		return s.writePWM(channel, intValue(params, "minDuty", channel.Duty), "sineWave")
+	case "bezierWave":
+		s.pwmRuntimes[targetID] = &pwmRuntime{Mode: "bezierWave", Params: cloneParams(params), StartedAt: time.Now().UTC()}
+		return s.writePWM(channel, intValue(params, "from", channel.Duty), "bezierWave")
+	case "randomWave":
+		s.pwmRuntimes[targetID] = &pwmRuntime{
+			Mode:        "randomWave",
+			Params:      cloneParams(params),
+			StartedAt:   time.Now().UTC(),
+			CurrentDuty: float64(channel.Duty),
+		}
+		return s.writePWM(channel, intValue(params, "minDuty", channel.Duty), "randomWave")
+	case "pulseWave":
+		s.pwmRuntimes[targetID] = &pwmRuntime{Mode: "pulseWave", Params: cloneParams(params), StartedAt: time.Now().UTC()}
+		return s.writePWM(channel, intValue(params, "highDuty", channel.Duty), "pulseWave")
+	default:
+		return fmt.Errorf("unsupported pwm helper mode %s", mode)
 	}
 }
 

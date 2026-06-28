@@ -16,6 +16,7 @@
 
 #include <ArduinoJson.h>
 #include <PubSubClient.h>
+#include <math.h>
 
 #define EEPROM_SIZE 1024
 
@@ -72,8 +73,47 @@ struct TimerConfig {
   int to;
   int durationMs;
   int intervalMs;
+  int periodMs;
   int repeat;
-  bool loop;
+  int loop;
+  int control1;
+  int control2;
+  int minDuty;
+  int maxDuty;
+  int smoothing;
+  int lowDuty;
+  int highDuty;
+  int onDurationMs;
+  int offDurationMs;
+  String curve;
+  String direction;
+};
+
+struct PWMRuntime {
+  bool active;
+  String mode;
+  unsigned long startedAt;
+  unsigned long lastStepAt;
+  int fromDuty;
+  int toDuty;
+  int durationMs;
+  int periodMs;
+  int intervalMs;
+  int control1;
+  int control2;
+  int minDuty;
+  int maxDuty;
+  int smoothing;
+  int lowDuty;
+  int highDuty;
+  int onDurationMs;
+  int offDurationMs;
+  int loopCount;
+  int randomDuty;
+  float currentDuty;
+  uint32_t randomSeed;
+  String curve;
+  String direction;
 };
 
 WiFiClient wifiClient;
@@ -95,8 +135,120 @@ ChannelConfig channels[8];
 size_t channelCount = 0;
 TimerConfig timers[80];
 size_t timerCount = 0;
+PWMRuntime pwmRuntimes[8];
 time_t lastTimerCheckAt = 0;
 bool apMode = false;
+int deviceTimezoneOffsetMinutes = 0;
+
+int parseLoopCount(JsonVariantConst value) {
+  if (value.isNull()) {
+    return 0;
+  }
+  if (value.is<bool>()) {
+    return value.as<bool>() ? -1 : 0;
+  }
+  if (value.is<int>()) {
+    return value.as<int>();
+  }
+  if (value.is<long>()) {
+    return (int)value.as<long>();
+  }
+  if (value.is<float>()) {
+    return (int)value.as<float>();
+  }
+  if (value.is<double>()) {
+    return (int)value.as<double>();
+  }
+  return 0;
+}
+
+float clampFloat(float value, float minValue, float maxValue) {
+  if (value < minValue) {
+    return minValue;
+  }
+  if (value > maxValue) {
+    return maxValue;
+  }
+  return value;
+}
+
+float cubicBezier(float t, float p0, float p1, float p2, float p3) {
+  float inv = 1.0f - t;
+  return inv * inv * inv * p0
+    + 3.0f * inv * inv * t * p1
+    + 3.0f * inv * t * t * p2
+    + t * t * t * p3;
+}
+
+float curveProgress(float progress, const String& curve, int fromDuty, int control1, int control2, int toDuty) {
+  progress = clampFloat(progress, 0.0f, 1.0f);
+  if (curve.length() == 0 || curve == "linear") {
+    return progress;
+  }
+  if (curve == "easeIn") {
+    return progress * progress * progress;
+  }
+  if (curve == "easeOut") {
+    float inv = 1.0f - progress;
+    return 1.0f - inv * inv * inv;
+  }
+  if (curve == "easeInOut") {
+    if (progress < 0.5f) {
+      return 4.0f * progress * progress * progress;
+    }
+    float inv = -2.0f * progress + 2.0f;
+    return 1.0f - (inv * inv * inv) / 2.0f;
+  }
+  if (curve == "smooth") {
+    return progress * progress * (3.0f - 2.0f * progress);
+  }
+  if (curve == "sineIn") {
+    return 1.0f - cosf((progress * PI) / 2.0f);
+  }
+  if (curve == "sineOut") {
+    return sinf((progress * PI) / 2.0f);
+  }
+  if (curve == "sineInOut") {
+    return -(cosf(PI * progress) - 1.0f) / 2.0f;
+  }
+  if (curve == "backIn") {
+    const float c1 = 1.70158f;
+    const float c3 = c1 + 1.0f;
+    return c3 * progress * progress * progress - c1 * progress * progress;
+  }
+  if (curve == "backOut") {
+    const float c1 = 1.70158f;
+    const float c3 = c1 + 1.0f;
+    float p = progress - 1.0f;
+    return 1.0f + c3 * p * p * p + c1 * p * p;
+  }
+  if (curve == "customBezier") {
+    float value = cubicBezier(progress, (float)fromDuty, (float)control1, (float)control2, (float)toDuty);
+    float span = (float)(toDuty - fromDuty);
+    if (span == 0.0f) {
+      return 0.0f;
+    }
+    return clampFloat((value - (float)fromDuty) / span, 0.0f, 1.0f);
+  }
+  return progress;
+}
+
+int randomBetween(PWMRuntime& runtime, int minValue, int maxValue) {
+  if (maxValue < minValue) {
+    int temp = minValue;
+    minValue = maxValue;
+    maxValue = temp;
+  }
+  if (minValue == maxValue) {
+    return minValue;
+  }
+  if (runtime.randomSeed == 0) {
+    runtime.randomSeed = (uint32_t)(micros() ^ millis() ^ (minValue << 8) ^ maxValue);
+  }
+  runtime.randomSeed = runtime.randomSeed * 1664525UL + 1013904223UL;
+  uint32_t range = (uint32_t)(maxValue - minValue + 1);
+  return minValue + (int)(runtime.randomSeed % range);
+}
 
 bool parseTimerTime(const String& value, uint8_t& hour, uint8_t& minute) {
   if (value.length() != 5 || value.charAt(2) != ':') {
@@ -157,14 +309,27 @@ bool appendTimerFromJson(const String& targetId, JsonVariant timerVariant) {
   timer.to = action["to"] | 0;
   timer.durationMs = action["durationMs"] | 1000;
   timer.intervalMs = action["intervalMs"] | 1000;
+  timer.periodMs = action["periodMs"] | 2500;
   timer.repeat = action["repeat"] | 1;
-  timer.loop = action["loop"] | false;
+  timer.loop = parseLoopCount(action["loop"]);
+  timer.control1 = action["control1"] | timer.to;
+  timer.control2 = action["control2"] | timer.from;
+  timer.minDuty = action["minDuty"] | 0;
+  timer.maxDuty = action["maxDuty"] | 1023;
+  timer.smoothing = action["smoothing"] | 35;
+  timer.lowDuty = action["lowDuty"] | 0;
+  timer.highDuty = action["highDuty"] | 0;
+  timer.onDurationMs = action["onDurationMs"] | 800;
+  timer.offDurationMs = action["offDurationMs"] | 1200;
+  timer.curve = action["curve"] | "linear";
+  timer.direction = action["direction"] | "once";
   timers[timerCount++] = timer;
   return true;
 }
 
 void loadTimersFromBootstrap(JsonObject deviceObject) {
   timerCount = 0;
+  deviceTimezoneOffsetMinutes = deviceObject["metadata"]["timezoneOffsetMinutes"] | 0;
   JsonArray timerGroups = deviceObject["timerGroups"].as<JsonArray>();
   for (JsonVariant groupVariant : timerGroups) {
     String targetId = groupVariant["targetId"] | "";
@@ -238,8 +403,18 @@ void executeTimerAction(const TimerConfig& timer) {
   if (operation == "direct") {
     int duty = timer.functionKey == "maxPower" ? channel->pwm.maxDuty : timer.duty;
     applyDirectPWM(timer.targetId, duty);
+  } else if (operation == "curveWave") {
+    applyCurveWave(timer.targetId, timer.from, timer.to, timer.control1, timer.control2, timer.durationMs, timer.curve, timer.direction, timer.loop);
   } else if (operation == "linearRamp") {
-    applyLinearRamp(timer.targetId, timer.from, timer.to, timer.durationMs);
+    applyLinearRamp(timer.targetId, timer.from, timer.to, timer.durationMs, timer.curve, timer.loop);
+  } else if (operation == "sineWave") {
+    applySineWave(timer.targetId, timer.minDuty, timer.maxDuty, timer.periodMs, timer.loop);
+  } else if (operation == "bezierWave") {
+    applyBezierWave(timer.targetId, timer.from, timer.control1, timer.control2, timer.to, timer.durationMs, timer.loop);
+  } else if (operation == "randomWave") {
+    applyRandomWave(timer.targetId, timer.minDuty, timer.maxDuty, timer.intervalMs, timer.smoothing, timer.loop);
+  } else if (operation == "pulseWave") {
+    applyPulseWave(timer.targetId, timer.lowDuty, timer.highDuty, timer.onDurationMs, timer.offDurationMs, timer.loop);
   } else if (operation == "softStart") {
     applySoftStart(timer.targetId, timer.to, timer.durationMs);
   } else if (operation == "softStop") {
@@ -262,8 +437,9 @@ void runLocalTimers() {
   }
   lastTimerCheckAt = now;
 
+  time_t localNow = now + (deviceTimezoneOffsetMinutes * 60);
   struct tm timeInfo;
-  localtime_r(&now, &timeInfo);
+  gmtime_r(&localNow, &timeInfo);
   int weekday = timeInfo.tm_wday == 0 ? 7 : timeInfo.tm_wday;
   for (size_t i = 0; i < timerCount; i++) {
     TimerConfig& timer = timers[i];
@@ -410,6 +586,7 @@ void loop() {
   ensureMqttConnected();
   mqttClient.loop();
   runLocalTimers();
+  runPWMRuntimes();
 
   if (millis() - lastStateReportAt > 5000) {
     publishStateReport();
@@ -664,6 +841,12 @@ void onMessage(char* topic, byte* payload, unsigned int length) {
     publishStateReport();
     return;
   }
+  if (kind == "system" && operation == "bootstrapRefresh") {
+    bootstrapFromServer();
+    setupChannelPins();
+    publishStateReport();
+    return;
+  }
 
   if (kind == "relay" && operation == "switch") {
     applyRelay(command["targetId"] | "", params["state"] | "off");
@@ -671,10 +854,30 @@ void onMessage(char* topic, byte* payload, unsigned int length) {
     applyRelayToggle(command["targetId"] | "");
   } else if (kind == "mos_pwm" && operation == "direct") {
     applyDirectPWM(command["targetId"] | "", params["duty"] | 0);
+  } else if (kind == "mos_pwm" && operation == "curveWave") {
+    applyCurveWave(
+      command["targetId"] | "",
+      params["from"] | 0,
+      params["to"] | 0,
+      params["control1"] | (params["to"] | 0),
+      params["control2"] | (params["from"] | 0),
+      params["durationMs"] | 3000,
+      params["curve"] | "linear",
+      params["direction"] | "once",
+      parseLoopCount(params["loop"])
+    );
   } else if (kind == "mos_pwm" && operation == "linearRamp") {
-    applyLinearRamp(command["targetId"] | "", params["from"] | 0, params["to"] | 0, params["durationMs"] | 1000);
+    applyLinearRamp(command["targetId"] | "", params["from"] | 0, params["to"] | 0, params["durationMs"] | 1000, params["curve"] | "linear", parseLoopCount(params["loop"]));
+  } else if (kind == "mos_pwm" && operation == "sineWave") {
+    applySineWave(command["targetId"] | "", params["minDuty"] | 0, params["maxDuty"] | 1000, params["periodMs"] | 2500, parseLoopCount(params["loop"]));
+  } else if (kind == "mos_pwm" && operation == "bezierWave") {
+    applyBezierWave(command["targetId"] | "", params["from"] | 0, params["control1"] | 0, params["control2"] | 0, params["to"] | 0, params["durationMs"] | 3000, parseLoopCount(params["loop"]));
+  } else if (kind == "mos_pwm" && operation == "randomWave") {
+    applyRandomWave(command["targetId"] | "", params["minDuty"] | 0, params["maxDuty"] | 1000, params["intervalMs"] | 1200, params["smoothing"] | 35, parseLoopCount(params["loop"]));
+  } else if (kind == "mos_pwm" && operation == "pulseWave") {
+    applyPulseWave(command["targetId"] | "", params["lowDuty"] | 0, params["highDuty"] | 1000, params["onDurationMs"] | 800, params["offDurationMs"] | 1200, parseLoopCount(params["loop"]));
   } else if (kind == "mos_pwm" && operation == "sequence") {
-    applySequence(command["targetId"] | "", params["steps"].as<JsonArray>(), params["loop"] | false);
+    applySequence(command["targetId"] | "", params["steps"].as<JsonArray>(), parseLoopCount(params["loop"]));
   } else if (kind == "mos_pwm" && operation == "stop") {
     applyDirectPWM(command["targetId"] | "", 0);
     ChannelConfig* channel = findChannel(command["targetId"] | "");
@@ -686,9 +889,9 @@ void onMessage(char* topic, byte* payload, unsigned int length) {
   } else if (kind == "mos_pwm" && operation == "softStop") {
     applySoftStop(command["targetId"] | "", params["from"] | -1, params["durationMs"] | 1000);
   } else if (kind == "mos_pwm" && operation == "pulse") {
-    applyPulse(command["targetId"] | "", params["duty"] | 0, params["durationMs"] | 1000, params["intervalMs"] | 1000, params["repeat"] | 1, params["loop"] | false);
+    applyPulse(command["targetId"] | "", params["duty"] | 0, params["durationMs"] | 1000, params["intervalMs"] | 1000, params["repeat"] | 1, parseLoopCount(params["loop"]));
   } else if (kind == "virtual_group" && operation == "sequenceGroup") {
-    applySequenceGroup(params["channels"].as<JsonArray>(), params["loop"] | false);
+    applySequenceGroup(params["channels"].as<JsonArray>(), parseLoopCount(params["loop"]));
   }
 
   publishStateReport();
@@ -701,6 +904,52 @@ ChannelConfig* findChannel(const String& targetId) {
     }
   }
   return nullptr;
+}
+
+int channelIndex(const String& targetId) {
+  for (size_t i = 0; i < channelCount; i++) {
+    if (channels[i].id == targetId) {
+      return (int)i;
+    }
+  }
+  return -1;
+}
+
+void clearPWMRuntime(const String& targetId) {
+  int index = channelIndex(targetId);
+  if (index < 0) {
+    return;
+  }
+  pwmRuntimes[index].active = false;
+  pwmRuntimes[index].mode = "";
+  pwmRuntimes[index].startedAt = 0;
+  pwmRuntimes[index].lastStepAt = 0;
+}
+
+PWMRuntime* ensurePWMRuntime(const String& targetId) {
+  int index = channelIndex(targetId);
+  if (index < 0) {
+    return nullptr;
+  }
+  PWMRuntime& runtime = pwmRuntimes[index];
+  runtime = PWMRuntime();
+  runtime.active = true;
+  runtime.startedAt = millis();
+  runtime.currentDuty = channels[index].currentDuty;
+  runtime.randomDuty = channels[index].currentDuty;
+  runtime.randomSeed = (uint32_t)(micros() ^ channels[index].gpio ^ runtime.startedAt);
+  return &runtime;
+}
+
+bool executeLoopCount(int loopCount, int& cycleIndex) {
+  if (loopCount < 0) {
+    return true;
+  }
+  if (cycleIndex > loopCount) {
+    return false;
+  }
+  cycleIndex += 1;
+  return true;
 }
 
 void applyRelay(String targetId, String state) {
@@ -731,26 +980,32 @@ void applyDirectPWM(String targetId, int duty) {
   if (channel == nullptr) {
     return;
   }
+  clearPWMRuntime(targetId);
   writePWM(*channel, duty);
   channel->currentMode = "direct";
 }
 
-void applyLinearRamp(String targetId, int fromDuty, int toDuty, int durationMs) {
+void applyLinearRamp(String targetId, int fromDuty, int toDuty, int durationMs, const String& curve, int loopCount) {
   ChannelConfig* channel = findChannel(targetId);
   if (channel == nullptr) {
     return;
   }
-  int steps = 40;
-  channel->currentMode = "linearRamp";
-  for (int i = 0; i <= steps; i++) {
-    int duty = fromDuty + ((toDuty - fromDuty) * i / steps);
-    writePWM(*channel, duty);
-    delay(durationMs / steps);
+  PWMRuntime* runtime = ensurePWMRuntime(targetId);
+  if (runtime == nullptr) {
+    return;
   }
+  runtime->mode = "linearRamp";
+  runtime->fromDuty = fromDuty;
+  runtime->toDuty = toDuty;
+  runtime->durationMs = durationMs > 0 ? durationMs : 1000;
+  runtime->curve = curve.length() == 0 ? "linear" : curve;
+  runtime->loopCount = loopCount;
+  channel->currentMode = "linearRamp";
+  writePWM(*channel, fromDuty);
 }
 
 void applySoftStart(String targetId, int toDuty, int durationMs) {
-  applyLinearRamp(targetId, 0, toDuty, durationMs);
+  applyLinearRamp(targetId, 0, toDuty, durationMs, "linear", 0);
   ChannelConfig* channel = findChannel(targetId);
   if (channel != nullptr) {
     channel->currentMode = "softStart";
@@ -766,21 +1021,124 @@ void applySoftStop(String targetId, int fromDuty, int durationMs) {
   if (startDuty < 0) {
     startDuty = channel->currentDuty;
   }
-  applyLinearRamp(targetId, startDuty, 0, durationMs);
+  applyLinearRamp(targetId, startDuty, 0, durationMs, "linear", 0);
   channel->currentMode = "softStop";
 }
 
-void applySequence(String targetId, JsonArray steps, bool loop) {
+void applyCurveWave(String targetId, int fromDuty, int toDuty, int control1, int control2, int durationMs, const String& curve, const String& direction, int loopCount) {
   ChannelConfig* channel = findChannel(targetId);
   if (channel == nullptr) {
     return;
   }
-  channel->currentMode = "sequence";
-  runSteps(*channel, steps, loop);
+  PWMRuntime* runtime = ensurePWMRuntime(targetId);
+  if (runtime == nullptr) {
+    return;
+  }
+  runtime->mode = "curveWave";
+  runtime->fromDuty = fromDuty;
+  runtime->toDuty = toDuty;
+  runtime->control1 = control1;
+  runtime->control2 = control2;
+  runtime->durationMs = durationMs > 0 ? durationMs : 3000;
+  runtime->curve = curve.length() == 0 ? "linear" : curve;
+  runtime->direction = direction.length() == 0 ? "once" : direction;
+  runtime->loopCount = loopCount;
+  channel->currentMode = "curveWave";
+  writePWM(*channel, fromDuty);
 }
 
-void applySequenceGroup(JsonArray channelsArray, bool loop) {
-  do {
+void applySineWave(String targetId, int minDuty, int maxDuty, int periodMs, int loopCount) {
+  ChannelConfig* channel = findChannel(targetId);
+  if (channel == nullptr) {
+    return;
+  }
+  PWMRuntime* runtime = ensurePWMRuntime(targetId);
+  if (runtime == nullptr) {
+    return;
+  }
+  runtime->mode = "sineWave";
+  runtime->minDuty = minDuty;
+  runtime->maxDuty = maxDuty;
+  runtime->periodMs = periodMs > 0 ? periodMs : 2500;
+  runtime->loopCount = loopCount;
+  channel->currentMode = "sineWave";
+  writePWM(*channel, minDuty);
+}
+
+void applyBezierWave(String targetId, int fromDuty, int control1, int control2, int toDuty, int durationMs, int loopCount) {
+  ChannelConfig* channel = findChannel(targetId);
+  if (channel == nullptr) {
+    return;
+  }
+  PWMRuntime* runtime = ensurePWMRuntime(targetId);
+  if (runtime == nullptr) {
+    return;
+  }
+  runtime->mode = "bezierWave";
+  runtime->fromDuty = fromDuty;
+  runtime->toDuty = toDuty;
+  runtime->control1 = control1;
+  runtime->control2 = control2;
+  runtime->durationMs = durationMs > 0 ? durationMs : 3000;
+  runtime->loopCount = loopCount;
+  channel->currentMode = "bezierWave";
+  writePWM(*channel, fromDuty);
+}
+
+void applyRandomWave(String targetId, int minDuty, int maxDuty, int intervalMs, int smoothing, int loopCount) {
+  ChannelConfig* channel = findChannel(targetId);
+  if (channel == nullptr) {
+    return;
+  }
+  PWMRuntime* runtime = ensurePWMRuntime(targetId);
+  if (runtime == nullptr) {
+    return;
+  }
+  runtime->mode = "randomWave";
+  runtime->minDuty = minDuty;
+  runtime->maxDuty = maxDuty;
+  runtime->intervalMs = intervalMs > 0 ? intervalMs : 1200;
+  runtime->smoothing = smoothing;
+  runtime->loopCount = loopCount;
+  runtime->lastStepAt = 0;
+  runtime->currentDuty = minDuty;
+  runtime->randomDuty = minDuty;
+  channel->currentMode = "randomWave";
+  writePWM(*channel, minDuty);
+}
+
+void applyPulseWave(String targetId, int lowDuty, int highDuty, int onDurationMs, int offDurationMs, int loopCount) {
+  ChannelConfig* channel = findChannel(targetId);
+  if (channel == nullptr) {
+    return;
+  }
+  PWMRuntime* runtime = ensurePWMRuntime(targetId);
+  if (runtime == nullptr) {
+    return;
+  }
+  runtime->mode = "pulseWave";
+  runtime->lowDuty = lowDuty;
+  runtime->highDuty = highDuty;
+  runtime->onDurationMs = onDurationMs > 0 ? onDurationMs : 800;
+  runtime->offDurationMs = offDurationMs > 0 ? offDurationMs : 1200;
+  runtime->loopCount = loopCount;
+  channel->currentMode = "pulseWave";
+  writePWM(*channel, highDuty);
+}
+
+void applySequence(String targetId, JsonArray steps, int loopCount) {
+  ChannelConfig* channel = findChannel(targetId);
+  if (channel == nullptr) {
+    return;
+  }
+  clearPWMRuntime(targetId);
+  channel->currentMode = "sequence";
+  runSteps(*channel, steps, loopCount);
+}
+
+void applySequenceGroup(JsonArray channelsArray, int loopCount) {
+  int cycleIndex = 0;
+  while (executeLoopCount(loopCount, cycleIndex)) {
     for (JsonVariant channelVariant : channelsArray) {
       String targetId = channelVariant["targetId"] | "";
       ChannelConfig* channel = findChannel(targetId);
@@ -788,12 +1146,13 @@ void applySequenceGroup(JsonArray channelsArray, bool loop) {
         continue;
       }
       JsonArray steps = channelVariant["steps"].as<JsonArray>();
-      runSteps(*channel, steps, false);
+      clearPWMRuntime(targetId);
+      runSteps(*channel, steps, 0);
     }
-  } while (loop);
+  }
 }
 
-void applyPulse(String targetId, int duty, int holdMs, int intervalMs, int repeat, bool loop) {
+void applyPulse(String targetId, int duty, int holdMs, int intervalMs, int repeat, int loopCount) {
   ChannelConfig* channel = findChannel(targetId);
   if (channel == nullptr) {
     return;
@@ -801,26 +1160,129 @@ void applyPulse(String targetId, int duty, int holdMs, int intervalMs, int repea
   if (repeat <= 0) {
     repeat = 1;
   }
+  clearPWMRuntime(targetId);
   channel->currentMode = "pulse";
-  do {
+  int cycleIndex = 0;
+  while (executeLoopCount(loopCount, cycleIndex)) {
     for (int index = 0; index < repeat; index++) {
       writePWM(*channel, duty);
       delay(holdMs);
       writePWM(*channel, 0);
       delay(intervalMs);
     }
-  } while (loop);
+  }
 }
 
-void runSteps(ChannelConfig& channel, JsonArray steps, bool loop) {
-  do {
+void runSteps(ChannelConfig& channel, JsonArray steps, int loopCount) {
+  int cycleIndex = 0;
+  while (executeLoopCount(loopCount, cycleIndex)) {
     for (JsonVariant step : steps) {
       int duty = step["duty"] | 0;
       int durationMs = step["durationMs"] | 1000;
       writePWM(channel, duty);
       delay(durationMs);
     }
-  } while (loop);
+  }
+}
+
+void runPWMRuntimes() {
+  unsigned long now = millis();
+  for (size_t i = 0; i < channelCount; i++) {
+    ChannelConfig& channel = channels[i];
+    if (channel.kind != CHANNEL_MOS_PWM) {
+      continue;
+    }
+    PWMRuntime& runtime = pwmRuntimes[i];
+    if (!runtime.active) {
+      continue;
+    }
+
+    unsigned long elapsedMs = now - runtime.startedAt;
+    bool done = false;
+    int nextDuty = channel.currentDuty;
+
+    if (runtime.mode == "linearRamp") {
+      float progress = (float)elapsedMs / (float)(runtime.durationMs > 0 ? runtime.durationMs : 1);
+      if (runtime.loopCount != 0) {
+        float cycle = fmodf(progress, 2.0f);
+        progress = cycle > 1.0f ? 2.0f - cycle : cycle;
+      } else {
+        progress = clampFloat(progress, 0.0f, 1.0f);
+      }
+      float eased = curveProgress(progress, runtime.curve, runtime.fromDuty, runtime.toDuty, runtime.fromDuty, runtime.toDuty);
+      nextDuty = (int)lroundf((float)runtime.fromDuty + (float)(runtime.toDuty - runtime.fromDuty) * eased);
+      done = runtime.loopCount >= 0 && elapsedMs >= (unsigned long)(runtime.durationMs * (runtime.loopCount + 1));
+    } else if (runtime.mode == "curveWave") {
+      float phase = (float)elapsedMs / (float)(runtime.durationMs > 0 ? runtime.durationMs : 1);
+      float cycleSpan = runtime.direction == "pingpong" ? 2.0f : 1.0f;
+      float local = phase;
+      if (runtime.loopCount != 0) {
+        local = fmodf(phase, cycleSpan);
+      }
+      if (runtime.direction == "pingpong") {
+        if (local > 1.0f) {
+          local = 2.0f - local;
+        }
+      } else {
+        local = clampFloat(local, 0.0f, 1.0f);
+      }
+      float eased = curveProgress(local, runtime.curve, runtime.fromDuty, runtime.control1, runtime.control2, runtime.toDuty);
+      nextDuty = (int)lroundf((float)runtime.fromDuty + (float)(runtime.toDuty - runtime.fromDuty) * eased);
+      done = runtime.loopCount >= 0 && phase >= cycleSpan * (float)(runtime.loopCount + 1);
+    } else if (runtime.mode == "sineWave") {
+      float progress = (float)elapsedMs / (float)(runtime.periodMs > 0 ? runtime.periodMs : 1);
+      float cycles = progress;
+      if (runtime.loopCount == 0 && progress >= 1.0f) {
+        cycles = 1.0f;
+      }
+      float value = (sinf(cycles * 2.0f * PI - PI / 2.0f) + 1.0f) / 2.0f;
+      nextDuty = (int)lroundf((float)runtime.minDuty + (float)(runtime.maxDuty - runtime.minDuty) * value);
+      done = runtime.loopCount >= 0 && progress >= (float)(runtime.loopCount + 1);
+    } else if (runtime.mode == "bezierWave") {
+      float progress = (float)elapsedMs / (float)(runtime.durationMs > 0 ? runtime.durationMs : 1);
+      if (runtime.loopCount != 0) {
+        progress = progress - floorf(progress);
+      } else {
+        progress = clampFloat(progress, 0.0f, 1.0f);
+      }
+      nextDuty = (int)lroundf(cubicBezier(progress, (float)runtime.fromDuty, (float)runtime.control1, (float)runtime.control2, (float)runtime.toDuty));
+      done = runtime.loopCount >= 0 && elapsedMs >= (unsigned long)(runtime.durationMs * (runtime.loopCount + 1));
+    } else if (runtime.mode == "randomWave") {
+      float smoothing = clampFloat((float)runtime.smoothing / 100.0f, 0.01f, 1.0f);
+      if (runtime.lastStepAt == 0) {
+        runtime.lastStepAt = now;
+        runtime.randomDuty = runtime.minDuty;
+        runtime.currentDuty = (float)channel.currentDuty;
+      }
+      if (now - runtime.lastStepAt >= (unsigned long)(runtime.intervalMs > 0 ? runtime.intervalMs : 1)) {
+        runtime.lastStepAt = now;
+        runtime.randomDuty = randomBetween(runtime, runtime.minDuty, runtime.maxDuty);
+      }
+      runtime.currentDuty += ((float)runtime.randomDuty - runtime.currentDuty) * smoothing;
+      nextDuty = (int)lroundf(runtime.currentDuty);
+      done = runtime.loopCount >= 0 && elapsedMs >= (unsigned long)(runtime.intervalMs * (runtime.loopCount + 1));
+    } else if (runtime.mode == "pulseWave") {
+      int cycleMs = runtime.onDurationMs + runtime.offDurationMs;
+      if (cycleMs <= 0) {
+        cycleMs = 1;
+      }
+      if (runtime.loopCount == 0 && elapsedMs >= (unsigned long)cycleMs) {
+        nextDuty = runtime.lowDuty;
+        done = true;
+      } else if (runtime.loopCount > 0 && elapsedMs >= (unsigned long)(cycleMs * (runtime.loopCount + 1))) {
+        nextDuty = runtime.lowDuty;
+        done = true;
+      } else {
+        int phaseMs = (int)(elapsedMs % (unsigned long)cycleMs);
+        nextDuty = phaseMs < runtime.onDurationMs ? runtime.highDuty : runtime.lowDuty;
+      }
+    }
+
+    writePWM(channel, nextDuty);
+    if (done) {
+      runtime.active = false;
+    }
+  }
 }
 
 void writePWM(ChannelConfig& channel, int duty) {

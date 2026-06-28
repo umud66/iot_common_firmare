@@ -580,20 +580,41 @@ func (s *simulator) startTimerLoop(ctx context.Context) {
 	}()
 }
 
+func (s *simulator) timerTimezoneOffsetMinutes() int {
+	if s.bootstrap.Device.Metadata == nil {
+		return 0
+	}
+	switch value := s.bootstrap.Device.Metadata["timezoneOffsetMinutes"].(type) {
+	case int:
+		return value
+	case int32:
+		return int(value)
+	case int64:
+		return int(value)
+	case float32:
+		return int(value)
+	case float64:
+		return int(value)
+	default:
+		return 0
+	}
+}
+
 func (s *simulator) processTimers(now time.Time) {
+	timerNow := now.Add(time.Duration(s.timerTimezoneOffsetMinutes()) * time.Minute)
 	for _, group := range s.bootstrap.Device.TimerGroups {
 		for _, timer := range group.Timers {
 			if !timer.Enabled || timer.At == "" {
 				continue
 			}
-			if !allowWeekday(now, timer.DaysOfWeek) {
+			if !allowWeekday(timerNow, timer.DaysOfWeek) {
 				continue
 			}
-			if now.Format("15:04") != timer.At {
+			if timerNow.Format("15:04") != timer.At {
 				continue
 			}
 			timerKey := group.TargetID + ":" + timer.ID
-			runMark := now.Format("2006-01-02 15:04")
+			runMark := timerNow.Format("2006-01-02 15:04")
 			s.mu.Lock()
 			if s.lastTimerRun[timerKey] == runMark {
 				s.mu.Unlock()
@@ -603,7 +624,7 @@ func (s *simulator) processTimers(now time.Time) {
 			s.mu.Unlock()
 
 			command := s.commandFromTimer(group.TargetID, timer.Action)
-			log.Printf("[定时器] target=%s timer=%s at=%s tz=UTC", group.TargetID, timer.ID, now.Format(time.RFC3339))
+			log.Printf("[定时器] target=%s timer=%s at=%s tzOffset=%d", group.TargetID, timer.ID, timerNow.Format(time.RFC3339), s.timerTimezoneOffsetMinutes())
 			if err := s.applyCommand(command); err != nil {
 				log.Printf("[定时器] 执行失败: %v", err)
 				continue
@@ -1102,6 +1123,22 @@ func (s *simulator) applyRelayCommand(command driverCommand) error {
 			return err
 		}
 		log.Printf("[继电器] %s toggle -> %s", command.TargetID, channel.State)
+	case "script":
+		runtime, loadedInline, err := s.ensureScriptRuntime(command)
+		if err != nil {
+			return err
+		}
+		if runtime == nil {
+			return fmt.Errorf("继电器通道 %s 未配置脚本", command.TargetID)
+		}
+		channel.Mode = "script"
+		channel.Status = "ok"
+		if loadedInline {
+			if err := s.saveState(); err != nil {
+				log.Printf("[继电器] 保存脚本状态失败: %v", err)
+			}
+		}
+		log.Printf("[继电器] %s 切换到脚本驱动", command.TargetID)
 	default:
 		log.Printf("[继电器] 未支持操作 %s", command.Operation)
 	}
@@ -1225,11 +1262,20 @@ func (s *simulator) applyPWMCommand(command driverCommand) error {
 		)
 	case "script":
 		delete(s.pwmRuntimes, command.TargetID)
-		if s.scripts[command.TargetID] == nil {
+		runtime, loadedInline, err := s.ensureScriptRuntime(command)
+		if err != nil {
+			return err
+		}
+		if runtime == nil {
 			return fmt.Errorf("PWM 通道 %s 未配置脚本", command.TargetID)
 		}
 		channel.Mode = "script"
 		channel.Status = "ok"
+		if loadedInline {
+			if err := s.saveState(); err != nil {
+				log.Printf("[造浪] 保存脚本状态失败: %v", err)
+			}
+		}
 		log.Printf("[造浪] %s 切换到脚本驱动", command.TargetID)
 	case "stop":
 		delete(s.pwmRuntimes, command.TargetID)
@@ -1241,6 +1287,41 @@ func (s *simulator) applyPWMCommand(command driverCommand) error {
 		log.Printf("[造浪] 未支持操作 %s", command.Operation)
 	}
 	return nil
+}
+
+func (s *simulator) ensureScriptRuntime(command driverCommand) (*scriptRuntime, bool, error) {
+	if source := strings.TrimSpace(stringValue(command.Params, "scriptSource", "")); source != "" {
+		program, err := parseUserScript(source)
+		if err != nil {
+			return nil, false, fmt.Errorf("脚本解析失败: %w", err)
+		}
+		runtime, err := newScriptRuntime(*program, s)
+		if err != nil {
+			return nil, false, fmt.Errorf("脚本初始化失败: %w", err)
+		}
+		if s.scripts == nil {
+			s.scripts = map[string]*scriptRuntime{}
+		}
+		s.scripts[command.TargetID] = runtime
+		s.persistScriptSource(command.TargetID, source)
+		return runtime, true, nil
+	}
+	return s.scripts[command.TargetID], false, nil
+}
+
+func (s *simulator) persistScriptSource(targetID string, source string) {
+	trimmed := strings.TrimSpace(source)
+	for index := range s.bootstrap.DriverInstances {
+		item := &s.bootstrap.DriverInstances[index]
+		if item.TargetID != targetID {
+			continue
+		}
+		if item.Config == nil {
+			item.Config = map[string]any{}
+		}
+		item.Config["scriptSource"] = trimmed
+		return
+	}
 }
 
 func (s *simulator) applyGroupCommand(command driverCommand) error {
@@ -1864,8 +1945,8 @@ func (s *simulator) printTimers() {
 	}
 	for _, group := range s.bootstrap.Device.TimerGroups {
 		for _, timer := range group.Timers {
-			log.Printf("[定时器] target=%s id=%s enabled=%v at=%s tz=UTC days=%v mode=%s function=%s",
-				group.TargetID, timer.ID, timer.Enabled, timer.At, timer.DaysOfWeek, timer.Action.Mode, timer.Action.Function)
+			log.Printf("[定时器] target=%s id=%s enabled=%v at=%s tzOffset=%d days=%v mode=%s function=%s",
+				group.TargetID, timer.ID, timer.Enabled, timer.At, s.timerTimezoneOffsetMinutes(), timer.DaysOfWeek, timer.Action.Mode, timer.Action.Function)
 		}
 	}
 }
