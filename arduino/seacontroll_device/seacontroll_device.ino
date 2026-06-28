@@ -1,3 +1,5 @@
+#include <Arduino_JSON.h>
+
 #include "device_config.h"
 
 #ifdef ESP32
@@ -14,7 +16,6 @@
 #include <time.h>
 #endif
 
-#include <ArduinoJson.h>
 #include <PubSubClient.h>
 #include <math.h>
 
@@ -52,10 +53,18 @@ struct ChannelConfig {
   String pinRole;
   String activeLevel;
   String defaultState;
+  String scriptSource;
   PWMInfo pwm;
   String currentState;
   int currentDuty;
   String currentMode;
+  String currentStatus;
+};
+
+struct MetricEntry {
+  String key;
+  float value;
+  bool used;
 };
 
 struct TimerConfig {
@@ -136,6 +145,7 @@ size_t channelCount = 0;
 TimerConfig timers[80];
 size_t timerCount = 0;
 PWMRuntime pwmRuntimes[8];
+MetricEntry metricEntries[16];
 time_t lastTimerCheckAt = 0;
 bool apMode = false;
 int deviceTimezoneOffsetMinutes = 0;
@@ -257,6 +267,100 @@ bool parseTimerTime(const String& value, uint8_t& hour, uint8_t& minute) {
   hour = value.substring(0, 2).toInt();
   minute = value.substring(3, 5).toInt();
   return hour < 24 && minute < 60;
+}
+
+String trimCopy(const String& value) {
+  String result = value;
+  result.trim();
+  return result;
+}
+
+String unquoteScriptArg(String value) {
+  value.trim();
+  if (value.length() >= 2 && ((value.charAt(0) == '"' && value.charAt(value.length() - 1) == '"') || (value.charAt(0) == '\'' && value.charAt(value.length() - 1) == '\''))) {
+    return value.substring(1, value.length() - 1);
+  }
+  return value;
+}
+
+int splitScriptArgs(const String& text, String args[], int maxArgs) {
+  int count = 0;
+  int start = 0;
+  bool inQuotes = false;
+  char quoteChar = 0;
+  for (int i = 0; i < text.length(); i++) {
+    char current = text.charAt(i);
+    if ((current == '"' || current == '\'') && (i == 0 || text.charAt(i - 1) != '\\')) {
+      if (!inQuotes) {
+        inQuotes = true;
+        quoteChar = current;
+      } else if (quoteChar == current) {
+        inQuotes = false;
+      }
+    } else if (current == ',' && !inQuotes) {
+      if (count < maxArgs) {
+        args[count++] = unquoteScriptArg(text.substring(start, i));
+      }
+      start = i + 1;
+    }
+  }
+  if (start <= text.length() && count < maxArgs) {
+    args[count++] = unquoteScriptArg(text.substring(start));
+  }
+  return count;
+}
+
+ChannelConfig* findChannel(const String& targetId);
+int channelIndex(const String& targetId);
+void clearPWMRuntime(const String& targetId);
+void writePWM(ChannelConfig& channel, int duty);
+void applyRelay(String targetId, String state);
+void applyRelayToggle(String targetId);
+void applyDirectPWM(String targetId, int duty);
+void applyLinearRamp(String targetId, int fromDuty, int toDuty, int durationMs, const String& curve, int loopCount);
+void applyCurveWave(String targetId, int fromDuty, int toDuty, int control1, int control2, int durationMs, const String& curve, const String& direction, int loopCount);
+void applySineWave(String targetId, int minDuty, int maxDuty, int periodMs, int loopCount);
+void applyBezierWave(String targetId, int fromDuty, int control1, int control2, int toDuty, int durationMs, int loopCount);
+void applyRandomWave(String targetId, int minDuty, int maxDuty, int intervalMs, int smoothing, int loopCount);
+void applyPulseWave(String targetId, int lowDuty, int highDuty, int onDurationMs, int offDurationMs, int loopCount);
+
+#include "script_engine_impl.h"
+
+bool parseScriptCall(const String& source, String& functionName, String args[], int& argCount, int maxArgs) {
+  String code = trimCopy(source);
+  if (code.length() == 0) {
+    return false;
+  }
+  int lineBreak = code.indexOf('\n');
+  if (lineBreak >= 0) {
+    code = trimCopy(code.substring(0, lineBreak));
+  }
+  int left = code.indexOf('(');
+  int right = code.lastIndexOf(')');
+  if (left <= 0 || right <= left) {
+    return false;
+  }
+  functionName = trimCopy(code.substring(0, left));
+  argCount = splitScriptArgs(code.substring(left + 1, right), args, maxArgs);
+  return functionName.length() > 0;
+}
+
+bool applyScriptSource(const String& targetId, const String& source) {
+  if (startScriptRuntime(targetId, source)) {
+    return true;
+  }
+  Serial.printf("script unsupported: %s\n", source.c_str());
+  return false;
+}
+
+void applySavedScriptIfNeeded(ChannelConfig& channel) {
+  if (channel.scriptSource.length() == 0) {
+    return;
+  }
+  if (applyScriptSource(channel.id, channel.scriptSource)) {
+    channel.currentStatus = "ok";
+    Serial.printf("script restored: %s\n", channel.id.c_str());
+  }
 }
 
 uint8_t buildDaysMask(JsonArray daysOfWeek) {
@@ -488,10 +592,12 @@ bool appendChannelFromCapability(JsonVariant capability) {
   config.pinRole = kindText == "relay" ? "control" : "pwm";
   config.activeLevel = capability["activeLevel"] | "high";
   config.defaultState = capability["defaultState"] | "off";
+  config.scriptSource = "";
   config.kind = kindText == "relay" ? CHANNEL_RELAY : CHANNEL_MOS_PWM;
   config.currentState = "off";
   config.currentDuty = 0;
   config.currentMode = "direct";
+  config.currentStatus = "ok";
   if (config.kind == CHANNEL_MOS_PWM) {
     JsonObject pwm = capability["pwm"];
     config.pwm.channel = pwm["channel"] | 0;
@@ -531,10 +637,12 @@ bool appendChannelFromDriverInstance(JsonVariant instance) {
   config.pinRole = pinRole;
   config.activeLevel = configJson["activeLevel"] | "high";
   config.defaultState = configJson["defaultPowerOnState"] | "off";
+  config.scriptSource = configJson["scriptSource"] | "";
   config.kind = kindText == "relay" ? CHANNEL_RELAY : CHANNEL_MOS_PWM;
   config.currentState = "off";
   config.currentDuty = 0;
   config.currentMode = "direct";
+  config.currentStatus = "ok";
   if (config.kind == CHANNEL_MOS_PWM) {
     config.pwm.channel = configJson["channel"] | 0;
     config.pwm.frequency = configJson["frequency"] | 20000;
@@ -586,6 +694,7 @@ void loop() {
   ensureMqttConnected();
   mqttClient.loop();
   runLocalTimers();
+  runScriptRuntimes();
   runPWMRuntimes();
 
   if (millis() - lastStateReportAt > 5000) {
@@ -796,6 +905,7 @@ void setupChannelPins() {
       digitalWrite(channels[i].gpio, relayLevel(channels[i], defaultOn));
       channels[i].currentState = defaultOn ? "on" : "off";
       channels[i].currentMode = "switch";
+      channels[i].currentStatus = "ok";
     } else {
 #ifdef ESP32
       ledcSetup(channels[i].pwm.channel, channels[i].pwm.frequency, 10);
@@ -808,7 +918,9 @@ void setupChannelPins() {
 #endif
       channels[i].currentDuty = 0;
       channels[i].currentMode = "direct";
+      channels[i].currentStatus = "ok";
     }
+    applySavedScriptIfNeeded(channels[i]);
   }
 }
 
@@ -852,6 +964,17 @@ void onMessage(char* topic, byte* payload, unsigned int length) {
     applyRelay(command["targetId"] | "", params["state"] | "off");
   } else if (kind == "relay" && operation == "toggle") {
     applyRelayToggle(command["targetId"] | "");
+  } else if (kind == "relay" && operation == "script") {
+    String targetId = command["targetId"] | "";
+    ChannelConfig* channel = findChannel(targetId);
+    String source = params["scriptSource"] | "";
+    if (channel != nullptr && source.length() == 0) {
+      source = channel->scriptSource;
+    }
+    if (channel != nullptr && source.length() > 0) {
+      channel->scriptSource = source;
+      applyScriptSource(targetId, source);
+    }
   } else if (kind == "mos_pwm" && operation == "direct") {
     applyDirectPWM(command["targetId"] | "", params["duty"] | 0);
   } else if (kind == "mos_pwm" && operation == "curveWave") {
@@ -876,6 +999,17 @@ void onMessage(char* topic, byte* payload, unsigned int length) {
     applyRandomWave(command["targetId"] | "", params["minDuty"] | 0, params["maxDuty"] | 1000, params["intervalMs"] | 1200, params["smoothing"] | 35, parseLoopCount(params["loop"]));
   } else if (kind == "mos_pwm" && operation == "pulseWave") {
     applyPulseWave(command["targetId"] | "", params["lowDuty"] | 0, params["highDuty"] | 1000, params["onDurationMs"] | 800, params["offDurationMs"] | 1200, parseLoopCount(params["loop"]));
+  } else if (kind == "mos_pwm" && operation == "script") {
+    String targetId = command["targetId"] | "";
+    ChannelConfig* channel = findChannel(targetId);
+    String source = params["scriptSource"] | "";
+    if (channel != nullptr && source.length() == 0) {
+      source = channel->scriptSource;
+    }
+    if (channel != nullptr && source.length() > 0) {
+      channel->scriptSource = source;
+      applyScriptSource(targetId, source);
+    }
   } else if (kind == "mos_pwm" && operation == "sequence") {
     applySequence(command["targetId"] | "", params["steps"].as<JsonArray>(), parseLoopCount(params["loop"]));
   } else if (kind == "mos_pwm" && operation == "stop") {
@@ -1320,15 +1454,24 @@ void publishStateReport() {
     JsonObject channelObject = channelsObject.createNestedObject(channels[i].id);
     channelObject["targetId"] = channels[i].id;
     channelObject["updatedAt"] = millis();
-    channelObject["status"] = "ok";
+    channelObject["status"] = channels[i].currentStatus;
     if (channels[i].kind == CHANNEL_RELAY) {
       channelObject["kind"] = "relay";
       channelObject["state"] = channels[i].currentState;
+      channelObject["mode"] = channels[i].currentMode;
     } else {
       channelObject["kind"] = "mos_pwm";
       channelObject["duty"] = channels[i].currentDuty;
       channelObject["mode"] = channels[i].currentMode;
     }
+  }
+
+  JsonObject metricsObject = doc.createNestedObject("metrics");
+  for (size_t i = 0; i < 16; i++) {
+    if (!metricEntries[i].used || metricEntries[i].key.length() == 0) {
+      continue;
+    }
+    metricsObject[metricEntries[i].key] = metricEntries[i].value;
   }
 
   String payload;
